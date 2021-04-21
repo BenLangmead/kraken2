@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 
-# Copyright 2013-2018, Derrick Wood <dwood@cs.jhu.edu>
+# Copyright 2013-2020, Derrick Wood <dwood@cs.jhu.edu>
 #
 # This file is part of the Kraken 2 taxonomic sequence classification system.
 
@@ -13,7 +13,7 @@ use File::Basename;
 use Getopt::Long;
 
 my $PROG = basename $0;
-my $KRAKEN2_DIR = "#####=KRAKEN2_DIR=#####";
+my $KRAKEN2_DIR = '#####=KRAKEN2_DIR=#####';
 
 # Test to see if the executables got moved, try to recover if we can
 if (! -e "$KRAKEN2_DIR/classify") {
@@ -47,6 +47,8 @@ my $minimum_base_quality = 0;
 my $report_filename;
 my $use_mpa_style = 0;
 my $report_zero_counts = 0;
+my $minimum_hit_groups = 2;
+my $report_minimizer_data = 0;
 
 GetOptions(
   "help" => \&display_help,
@@ -68,6 +70,8 @@ GetOptions(
   "report=s" => \$report_filename,
   "use-mpa-style" => \$use_mpa_style,
   "report-zero-counts" => \$report_zero_counts,
+  "minimum-hit-groups=i" => \$minimum_hit_groups,
+  "report-minimizer-data" => \$report_minimizer_data,
 );
 
 if (! defined $threads) {
@@ -107,6 +111,9 @@ if ($confidence_threshold < 0) {
 if ($confidence_threshold > 1) {
   die "$PROG: confidence threshold must be no greater than 1\n";
 }
+if ($minimum_hit_groups < 0) {
+  die "$PROG: minimum number of hit groups must be nonnegative\n";
+}
 
 my $auto_detect = ! $compressed;
 if ($auto_detect) {
@@ -131,6 +138,8 @@ push @flags, "-R", $report_filename if defined $report_filename;
 push @flags, "-m" if $use_mpa_style;
 push @flags, "-z" if $report_zero_counts;
 push @flags, "-M" if $memory_mapping;
+push @flags, "-g", $minimum_hit_groups;
+push @flags, "-K" if $report_minimizer_data;
 
 # Stupid hack to keep filehandles from closing before exec
 # filehandles opened inside for loop below go out of scope
@@ -196,11 +205,17 @@ Options:
                           kraken-mpa-report
   --report-zero-counts    With --report, report counts for ALL taxa, even if
                           counts are zero
+  --report-minimizer-data With --report, report minimizer and distinct minimizer
+                          count information in addition to normal Kraken report
   --memory-mapping        Avoids loading database into RAM
   --paired                The filenames provided have paired-end reads
   --use-names             Print scientific names instead of just taxids
   --gzip-compressed       Input files are compressed with gzip
   --bzip2-compressed      Input files are compressed with bzip2
+  --minimum-hit-groups NUM
+                          Minimum number of hit groups (overlapping k-mers
+                          sharing the same minimizer) needed to make a call
+                          (default: $minimum_hit_groups)
   --help                  Print this message
   --version               Print version information
 
@@ -216,7 +231,7 @@ sub display_help {
 
 sub display_version {
   print "Kraken version #####=VERSION=#####\n";
-  print "Copyright 2013-2018, Derrick Wood (dwood\@cs.jhu.edu)\n";
+  print "Copyright 2013-2020, Derrick Wood (dwood\@cs.jhu.edu)\n";
   exit 0;
 }
 

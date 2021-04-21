@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2018, Derrick Wood <dwood@cs.jhu.edu>
+ * Copyright 2013-2020, Derrick Wood <dwood@cs.jhu.edu>
  *
  * This file is part of the Kraken 2 taxonomic sequence classification system.
  */
@@ -141,7 +141,8 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
   }
 
   if (opts.spaced_seed_mask != DEFAULT_SPACED_SEED_MASK)
-    ExpandSpacedSeedMask(opts.spaced_seed_mask, opts.input_is_protein ? 3 : 2);
+    ExpandSpacedSeedMask(opts.spaced_seed_mask,
+      opts.input_is_protein ? BITS_PER_CHAR_PRO : BITS_PER_CHAR_DNA);
   if (opts.k == 0 || opts.l == 0) {
     cerr << "missing mandatory integer parameter" << endl;
     usage();
@@ -170,10 +171,15 @@ void usage(int exit_code) {
 void ProcessSequence(string &seq, Options &opts,
     vector<unordered_set<uint64_t>> &sets)
 {
-  MinimizerScanner scanner(opts.k, opts.l, opts.toggle_mask, ! opts.input_is_protein, opts.spaced_seed_mask);
+  MinimizerScanner scanner(opts.k, opts.l, opts.spaced_seed_mask, ! opts.input_is_protein, opts.toggle_mask);
+  // Add terminator for protein sequences if not already there
+  if (opts.input_is_protein && seq.back() != '*')
+    seq.push_back('*');
   scanner.LoadSequence(seq);
   uint64_t *minimizer_ptr;
   while ((minimizer_ptr = scanner.NextMinimizer())) {
+    if (scanner.is_ambiguous())
+      continue;
     uint64_t hash_code = MurmurHash3(*minimizer_ptr);
     if ((hash_code & RANGE_MASK) < opts.n) {
       #pragma omp critical(set_insert)

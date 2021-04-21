@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2018, Derrick Wood <dwood@cs.jhu.edu>
+ * Copyright 2013-2020, Derrick Wood <dwood@cs.jhu.edu>
  *
  * This file is part of the Kraken 2 taxonomic sequence classification system.
  */
@@ -7,6 +7,7 @@
 #include "kraken2_headers.h"
 #include "compact_hash.h"
 #include "taxonomy.h"
+#include "mmscanner.h"
 #include "kraken2_data.h"
 #include "reports.h"
 
@@ -59,24 +60,33 @@ int main(int argc, char **argv) {
     << (idx_opts.dna_db ? "nucleotide" : "protein") << " db, "
     << "k = " << idx_opts.k << ", "
     << "l = " << idx_opts.l << "\n"
-    << "# Spaced mask = " << mask2str(idx_opts.spaced_seed_mask, idx_opts.l * (idx_opts.dna_db ? 2 : 4)) << "\n"
+    << "# Spaced mask = "
+      << mask2str(idx_opts.spaced_seed_mask,
+          idx_opts.l * (idx_opts.dna_db ? BITS_PER_CHAR_DNA : BITS_PER_CHAR_PRO))
+      << "\n"
     << "# Toggle mask = " << mask2str(idx_opts.toggle_mask, 64) << "\n"
     << "# Total taxonomy nodes: " << taxonomy.node_count() << "\n"
     << "# Table size: " << kraken_index.size() << "\n"
     << "# Table capacity: " << kraken_index.capacity() << "\n"
-    << "# Min clear hash value = " << idx_opts.minimum_acceptable_hash_value << std::endl;
+    << "# Min clear hash value = " << idx_opts.minimum_acceptable_hash_value << "\n";
+  if (idx_opts.revcom_version != CURRENT_REVCOM_VERSION)
+    std::cout << "# Built with outdated revcom version\n";
+  std::cout << std::flush;
 
   if (! opts.skip_counts) {
     taxon_counts_t taxid_counts = kraken_index.GetValueCounts();
     uint64_t total_seqs = 0;
+    taxon_counters_t taxid_counters;
     for (auto &kv_pair : taxid_counts) {
       total_seqs += kv_pair.second;
+      READCOUNTER rc(kv_pair.second, 0);
+      taxid_counters[kv_pair.first] = rc;
     }
     if (opts.use_mpa_style)
-      ReportMpaStyle(opts.output_filename, opts.report_zeros, taxonomy, taxid_counts);
+      ReportMpaStyle(opts.output_filename, opts.report_zeros, taxonomy, taxid_counters);
     else
-      ReportKrakenStyle(opts.output_filename, opts.report_zeros, taxonomy,
-          taxid_counts, total_seqs, 0);
+      ReportKrakenStyle(opts.output_filename, opts.report_zeros, false, taxonomy,
+          taxid_counters, total_seqs, 0);
   }
 
   return 0;

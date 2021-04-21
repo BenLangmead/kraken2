@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2013-2018, Derrick Wood <dwood@cs.jhu.edu>
+# Copyright 2013-2020, Derrick Wood <dwood@cs.jhu.edu>
 #
 # This file is part of the Kraken 2 taxonomic sequence classification system.
 
@@ -26,10 +26,11 @@ if [ -n "$KRAKEN2_USE_FTP" ]; then
   ftp_flag="--use-ftp"
 fi
 
-kraken2-build --db $KRAKEN2_DB_NAME --download-taxonomy --skip-maps $masking_flag $protein_flag $ftp_flag
+kraken2-build --db $KRAKEN2_DB_NAME --download-taxonomy $masking_flag $protein_flag $ftp_flag
 kraken2-build --db $KRAKEN2_DB_NAME --download-library archaea $masking_flag $protein_flag $ftp_flag
 kraken2-build --db $KRAKEN2_DB_NAME --download-library bacteria $masking_flag $protein_flag $ftp_flag
 kraken2-build --db $KRAKEN2_DB_NAME --download-library viral $masking_flag $protein_flag $ftp_flag
+kraken2-build --db $KRAKEN2_DB_NAME --download-library plasmid $masking_flag $protein_flag $ftp_flag
 kraken2-build --db $KRAKEN2_DB_NAME --download-library human --no-mask $protein_flag $ftp_flag
 if [ -z "$KRAKEN2_PROTEIN_DB" ]; then
   kraken2-build --db $KRAKEN2_DB_NAME --download-library UniVec_Core $masking_flag $ftp_flag

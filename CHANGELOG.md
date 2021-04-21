@@ -2,12 +2,77 @@
 
 ## Unreleased
 
+### Fixed
+- Bug that caused classification to not work when k-mer length was equal
+  to minimizer length
+
+## [2.1.1] - 2020-11-08
+
+### Fixed
+- Compilation error with GCC 10, omission of cstdint header
+- Removed --skip-maps from standard install due to addition of plasmids,
+  which require acc/taxid maps
+
+## [2.1.0] - 2020-10-13
+
+### Added
+- Small viral reference set and read simulator for future testing
+- Build options to aid testing
+- Integration of HLL to estimate distinct minimizer counts
+
+### Changed
+- Build code now creates databases with deterministic MD5 sums by default;
+  --fast-build option to kraken2-build introduced to access old behavior
+- Added plasmid library to standard installation set
+- Updated SILVA to release 138.1
+
+### Fixed
+- Modified build code to prevent insertion of minimizers with ambiguous bases
+- Bug where hit list output in quick mode used internal taxid (not external)
+- No more attempts to download "na" paths from FTP site
+- Runaway memory usage bug with unpaired classification (thanks to D. Cameron)
+- Modified estimation code to better handle small reference libraries
+
+## [2.0.9] - 2020-04-07 (beta)
+
+### Added
+- Expose --load-factor setting to kraken2-build
+- New --minimum-hit-groups option to kraken2
+
+### Changed
+- Require 2 hit groups (set of overlapping k-mers w/ same minimizer) to
+  make classification by default
+- Allow build options to pass through to subsequent invocations (e.g.,
+  k-mer length for 16S DBs)
+- Removed env options for library downloads (no longer available from
+  same NCBI location)
+- Updated SILVA to release 138
+
+### Fixed
+- Removed mention of --fastq-input from Manual
+- Made PE read identifier suffix trimming more restrictive (only on /1 and /2)
+- Bug where some reads would be classified with taxid 0
+- Bug that didn't allow kraken2-inspect to work with large databases
+
+## [2.0.8] - 2019-04-25 (beta)
+
 ### Added
 - FTP downloading option for taxonomy/libraries (--use-ftp for kraken2-build)
 - Option to skip downloading taxonomy maps
 
+### Changed
+- Added lookup table to speed up parsing in MinimizerScanner class
+- Default parameters for minimizer lengths and spaces changed (spaces=7 for
+  nucleotide search, length=12 for translated search)
+
 ### Fixed
+- Linked space expansion value for proteins to constant used by MinimizerScanner
 - Reporting of taxids in classified-out sequence files
+- Confidence scoring bug associated with failure to leave some sequences
+  unclassified
+- Reverse complement shifting bug, code made backwards-compatible with
+  existing databases (newly created DBs will have fix)
+- NCBI taxonomy download error due to removal of EST/GSS files
 
 ## [2.0.7] - 2018-08-11 (beta)
 
