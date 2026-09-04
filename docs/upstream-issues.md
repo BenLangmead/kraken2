@@ -47,6 +47,14 @@ still-live allocation and silently returns a stale key.
 Semantically, the pre-refactor code only registered a k-mer when the minimizer
 *changed*, never on a repeat, so this also inflates distinct-k-mer estimates.
 
+Our batched path does not reproduce this, so under `-K` our report's clade k-mer
+and distinct-k-mer columns differ from upstream's; every other column, including
+all read counts, matches. We do keep one inert side effect of the bug: it creates
+a counter entry for taxon 0, and because `KrakenReportDFS` orders sibling taxa
+with a comparator that branches on whether a taxon is present in the map at all,
+dropping that entry reorders equal-count rows. We create it once per block so
+reports stay byte-identical, and that line should go when this is fixed.
+
 Cost is small: removing the line changed 10M read pairs from 25.11s to 24.76s at 8
 threads, so this is a correctness report rather than a performance one.
 

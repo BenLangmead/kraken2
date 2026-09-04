@@ -80,6 +80,7 @@ struct Options {
   string taxon_counters_dump_filename;
   bool mpa_style_report;
   bool report_kmer_data;
+  bool need_kraken_output;
   bool quick_mode;
   bool report_zero_counts;
   bool use_translated_search;
@@ -591,6 +592,15 @@ void ProcessFiles(const char *filename1, const char *filename2,
       u1_oss.str("");
       u2_oss.str("");
       thread_taxon_counters.clear();
+      // Upstream's per-read path registers a k-mer on every repeat token, which
+      // creates an entry for taxon 0 whenever the previous minimizer missed (see
+      // docs/upstream-issues.md).  Nothing reads that entry, but the report
+      // orders equal-count sibling taxa with a comparator that branches on map
+      // membership, so its presence changes row order.  Create it once per block
+      // to keep reports byte-identical; drop this when the upstream bug is fixed.
+      if (! opts.report_filename.empty() ||
+          ! opts.taxon_counters_dump_filename.empty())
+        thread_taxon_counters[0];
 
       // Gather the block's fragments, then classify in sub-batches so the
       // probes of thousands of reads can be issued together.
@@ -913,7 +923,14 @@ static taxid_t ResolveFragmentTokens(Sequence &dna, Sequence &dna2,
   taxa.clear();
   hit_counts.clear();
   int64_t minimizer_hit_groups = 0;
+  // Only -K and a counters dump consume kmerCount/distinctKmerCount, and the
+  // sketch insert is not cheap, so a plain report skips it.  The counter itself
+  // is still created: the report sorts sibling taxa with a comparator that
+  // branches on whether a taxon is present in the map at all, so dropping
+  // entries for taxa that have hits but no reads would reorder equal-count rows.
   const bool want_counters = ! opts.report_filename.empty() ||
+      ! opts.taxon_counters_dump_filename.empty();
+  const bool want_kmer_sketch = opts.report_kmer_data ||
       ! opts.taxon_counters_dump_filename.empty();
   taxid_t last_taxon = 0;
 
@@ -939,8 +956,11 @@ static taxid_t ResolveFragmentTokens(Sequence &dna, Sequence &dna2,
         last_taxon = taxon;
         if (taxon) {
           minimizer_hit_groups++;
-          if (want_counters)
-            curr_taxon_counts[taxon].add_kmer(lookup_keys[tok.key_idx]);
+          if (want_counters) {
+            READCOUNTER &rc = curr_taxon_counts[taxon];
+            if (want_kmer_sketch)
+              rc.add_kmer(lookup_keys[tok.key_idx]);
+          }
         }
         break;
       default:  // TOK_REPEAT
@@ -981,6 +1001,9 @@ static taxid_t FinishClassification(Sequence &dna, Sequence &dna2,
     if (!opts.report_filename.empty() || !opts.taxon_counters_dump_filename.empty())
       curr_taxon_counts[call].incrementReadCount();
   }
+
+  if (! opts.need_kraken_output)
+    return call;
 
   if (call)
     koss << "C\t";
@@ -1121,8 +1144,11 @@ taxid_t ClassifySequence(Sequence &dna, Sequence &dna2, ostringstream &koss,
           last_taxon = taxon;
           if (taxon) {
             minimizer_hit_groups++;
-            if (!opts.report_filename.empty() || !opts.taxon_counters_dump_filename.empty())
-              curr_taxon_counts[taxon].add_kmer(lookup_keys[tok.key_idx]);
+            if (!opts.report_filename.empty() || !opts.taxon_counters_dump_filename.empty()) {
+              READCOUNTER &rc = curr_taxon_counts[taxon];
+              if (opts.report_kmer_data || !opts.taxon_counters_dump_filename.empty())
+                rc.add_kmer(lookup_keys[tok.key_idx]);
+            }
           }
           break;
         default:  // TOK_REPEAT
@@ -1359,6 +1385,9 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
     warnx("mandatory filename missing");
     usage();
   }
+
+  // "-" silences per-read output, so the hitlist string it feeds is dead work.
+  opts.need_kraken_output = (opts.kraken_output_filename != "-");
 
   if (opts.mpa_style_report && opts.report_filename.empty()) {
     warnx("-m requires -R be used");
