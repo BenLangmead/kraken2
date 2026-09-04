@@ -107,3 +107,46 @@ minimizers the scanner emits. It bundles a real fix too, `lmer_ = 0` in
 `LoadSequence`, which had been leaking l-mer bits across sequences. At the time of
 writing the commit is eight days old, so this may not be in a release yet, and
 asking what was intended is more useful than filing it as a defect.
+
+## 3. HyperLogLog merge does not apply the sparse-to-dense threshold that insert does
+
+`src/hyperloglogplus.cc`. Inserting a single item checks whether the sparse list
+has outgrown its budget and converts if so:
+
+```cpp
+    if (sparse && this->sparseList.size() + 1 > this->m/4) {
+       switchToNormalRepresentation();
+     }
+```
+
+Merging two sparse sketches does not:
+
+```cpp
+      if (this->sparse && other.sparse) {
+        // consider using addHashToSparseList(this->sparseList, val, pPrime) and checking for sizes
+        this->sparseList.insert(other.sparseList.begin(), other.sparseList.end());
+```
+
+With the defaults `p = 12` and `pPrime = 25`, the threshold is `m/4 = 1024`. A
+sketch assembled by merging can therefore carry a sparse list far past 1024 and
+still be flagged sparse, while the same items inserted serially would have
+converted to dense at the 1025th. The two representations are then estimated by
+different code paths in `ertlCardinality`: sparse uses `q = 64 - pPrime` over
+`mPrime = 2^25` registers, which is near exact at these cardinalities, and dense
+uses `q = 64 - p` over 4096 registers, whose standard error is about 1.6%.
+
+The consequence is that `distinctKmerCount` depends on how reads were partitioned
+across threads, because the partition decides whether any one thread's sketch
+crosses the threshold before the merge. The dense merge path is a register-wise
+maximum and is properly commutative and associative, so this is the only place
+the invariance breaks.
+
+Observed by changing only the input block size: with identical inputs, and with
+issue 1 patched out of both builds so it could not be the cause, the total k-mer
+counts and every read count stayed identical while the distinct k-mer column
+differed on about 6% of report lines, by a median of 0.95% and at most 2.80%.
+
+The fix is the one the comment already suggests: apply the same threshold check
+after the union, so a merged sketch converts exactly when a serially built one
+would. That would make the estimate partition-invariant. It matters beyond
+threading, since the multi-database merge path also combines sketches.
