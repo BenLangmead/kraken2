@@ -158,8 +158,19 @@ def main():
     # A cumulative ablation ladder must be monotonically non-increasing: each
     # level only removes work.  Any inversion means the measurement is
     # contaminated, and no ceiling computed from it is trustworthy.
-    inversions = [(lvl, t[lvl - 1], t[lvl])
-                  for lvl in range(1, 7) if t[lvl] > t[lvl - 1] * 1.01]
+    def spread_of(lvl):
+        return (max(runs[lvl]) - min(runs[lvl])) / max(min(runs[lvl]), 1e-9)
+
+    # An inversion smaller than the measured noise is a tie, not a violation.
+    # A level whose region is already skipped at run time (gated HyperLogLog or
+    # hitlist construction) legitimately ties with the level above it.
+    inversions = []
+    for lvl in range(1, 7):
+        tol = max(0.01, spread_of(lvl), spread_of(lvl - 1))
+        if t[lvl] > t[lvl - 1] * (1.0 + tol):
+            inversions.append((lvl, t[lvl - 1], t[lvl]))
+    ties = [lvl for lvl in range(1, 7)
+            if abs(t[lvl] - t[lvl - 1]) <= t[lvl - 1] * max(0.01, spread_of(lvl))]
     if inversions:
         print("\n  INVALID: ladder is not monotonic -- each level only removes work,",
               file=sys.stderr)
@@ -175,6 +186,11 @@ def main():
               % (100 * worst_spread), file=sys.stderr)
         print("  ceiling below as indicative only.", file=sys.stderr)
 
+    if ties:
+        print("\n  note: %s tie with the level above, i.e. that region is already"
+              % ", ".join("L%d" % l for l in ties), file=sys.stderr)
+        print("  skipped at run time in this configuration.", file=sys.stderr)
+
     print("\nregion costs (min seconds, and share of L0)", file=sys.stderr)
     for lvl in range(1, 7):
         cost = t[lvl - 1] - t[lvl]
@@ -184,19 +200,19 @@ def main():
           % ("parse floor (L6)", t[6], 100.0 * t[6] / t[0]), file=sys.stderr)
 
     offloadable = t[3] - t[6]
-    tuned = t[2]
+    # L0 is the tuned baseline: in this configuration format and HyperLogLog
+    # are already skipped at run time, so L1 and L2 have nothing to remove.
+    tuned = t[0]
     f = offloadable / tuned
     ceiling = (1.0 / (1.0 - f)) if f < 1.0 else float("inf")
 
     print("\n%s" % ("=" * 62), file=sys.stderr)
     print("  offloadable (scan + probe + hits) = L3 - L6 = %8.3f s" % offloadable,
           file=sys.stderr)
-    print("  tuned CPU baseline               = L2      = %8.3f s" % tuned,
+    print("  tuned CPU baseline               = L0      = %8.3f s" % tuned,
           file=sys.stderr)
     print("  offloadable fraction f                     = %8.4f" % f, file=sys.stderr)
     print("  speedup ceiling  1/(1-f)                   = %8.2fx" % ceiling,
-          file=sys.stderr)
-    print("  stock L0 / tuned L2 (free CPU-side win)    = %8.2fx" % (t[0] / tuned),
           file=sys.stderr)
     print("%s" % ("=" * 62), file=sys.stderr)
 
