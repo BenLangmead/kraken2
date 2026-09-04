@@ -43,6 +43,7 @@ build_db.o: build_db.cc build_db.h taxonomy.h mmscanner.h seqreader.h compact_ha
 lookup_accession_numbers.o: lookup_accession_numbers.cc mmap_file.h utilities.h
 k2mask.o: k2mask.cc gzstream.h threadpool.h
 k2bgzf.o: k2bgzf.cc
+k2mindump.o: k2mindump.cc mmscanner.h fast_reader.h kraken2_data.h
 merge.o: merge.cc taxonomy.cc reports.cc mmap_file.cc utilities.cc hyperloglogplus.cc
 
 blast_defline.o: blast_defline.c
@@ -71,6 +72,10 @@ k2mask: k2mask.o seqreader.o
 # PROGS because it is a preparation tool rather than part of a classify run.
 k2bgzf: k2bgzf.o
 	$(CXX) $(CXXFLAGS) -o $@ k2bgzf.o $(LDFLAGS) $(KRAKEN2_INFLATE_LIB)
+
+# Reference minimizer stream, used as the oracle when checking a device scan.
+k2mindump: k2mindump.o mmscanner.o fast_reader.o bgzf_index.o seqreader.o omp_hack.o
+	$(CXX) $(CXXFLAGS) -o $@ k2mindump.o mmscanner.o fast_reader.o bgzf_index.o seqreader.o omp_hack.o $(LDFLAGS) $(KRAKEN2_INFLATE_LIB)
 
 merge: merge.o taxonomy.o reports.o mmap_file.o utilities.o hyperloglogplus.o
 	$(CXX) $(CXXFLAGS) -o $@ merge.o taxonomy.o reports.o mmap_file.o utilities.o hyperloglogplus.o -lc
