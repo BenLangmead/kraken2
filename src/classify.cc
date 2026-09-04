@@ -9,6 +9,7 @@
 #include <sys/types.h>
 
 #include "kraken2_headers.h"
+#include <algorithm>
 #include "kv_store.h"
 #include "taxonomy.h"
 #include "seqreader.h"
@@ -33,6 +34,9 @@ using namespace kraken2;
 
 static const size_t NUM_FRAGMENTS_PER_THREAD = 10000;
 static const size_t INPUT_BLOCK_BYTES = 8 * 1024 * 1024;
+// Small enough that a sub-batch's token stream stays cache resident, large
+// enough that its probes give the prefetcher plenty to overlap.
+static const size_t FRAGMENTS_PER_SUBBATCH = 4096;
 static const taxid_t MATE_PAIR_BORDER_TAXON = TAXID_MAX;
 static const taxid_t READING_FRAME_BORDER_TAXON = TAXID_MAX - 1;
 static const taxid_t AMBIGUOUS_SPAN_TAXON = TAXID_MAX - 2;
@@ -166,6 +170,14 @@ void ReportStats(struct timeval time1, struct timeval time2,
     ClassificationStats &stats);
 void InitializeOutputs(Options &opts, OutputStreamData &outputs, SequenceFormat format);
 void MaskLowQualityBases(Sequence &dna, int minimum_quality_score);
+static void ScanFragmentTokens(Sequence &dna, Sequence &dna2, Options &opts,
+    IndexOptions &idx_opts, MinimizerScanner &scanner,
+    vector<MinToken> &tok_stream, vector<uint64_t> &lookup_keys);
+static taxid_t ResolveFragmentTokens(Sequence &dna, Sequence &dna2,
+    const MinToken *toks, size_t tok_count, const uint64_t *lookup_keys,
+    const hvalue_t *lookup_vals, ostringstream &koss, Taxonomy &taxonomy,
+    Options &opts, ClassificationStats &stats, vector<taxid_t> &taxa,
+    taxon_counts_t &hit_counts, taxon_counters_t &curr_taxon_counts);
 
 
 void RemoveBlocking(int fd) {
@@ -527,6 +539,11 @@ void ProcessFiles(const char *filename1, const char *filename2,
     Sequence *seq1 = nullptr, *seq2 = nullptr;
     FastReader reader1, reader2;
     size_t idx1 = 0, idx2 = 0;
+    vector<std::pair<Sequence *, Sequence *> > frags;
+    vector<MinToken> batch_toks;
+    vector<uint64_t> batch_keys;
+    vector<hvalue_t> batch_vals;
+    vector<std::pair<uint32_t, uint32_t> > frag_toks;
     uint64_t block_id;
     OutputData out_data;
     taxon_counters_t thread_taxon_counters;
@@ -575,67 +592,105 @@ void ProcessFiles(const char *filename1, const char *filename2,
       u2_oss.str("");
       thread_taxon_counters.clear();
 
+      // Gather the block's fragments, then classify in sub-batches so the
+      // probes of thousands of reads can be issued together.
+      frags.clear();
       while (idx1 < reader1.size()) {
-        seq1 = &reader1.at(idx1++);
-        auto valid_fragment = true;
-        if (opts.paired_end_processing && valid_fragment) {
+        Sequence *a = &reader1.at(idx1++), *b = nullptr;
+        if (opts.paired_end_processing) {
           if (opts.single_file_pairs) {
-            valid_fragment = idx1 < reader1.size();
-            seq2 = valid_fragment ? &reader1.at(idx1++) : nullptr;
+            if (idx1 >= reader1.size()) break;
+            b = &reader1.at(idx1++);
           } else {
-            valid_fragment = idx2 < reader2.size();
-            seq2 = valid_fragment ? &reader2.at(idx2++) : nullptr;
+            if (idx2 >= reader2.size()) break;
+            b = &reader2.at(idx2++);
           }
-          if (! valid_fragment)
-            break;
-          if (!seq1->compare_header(seq2->header)) {
+          if (!a->compare_header(b->header)) {
             errx(1, "ERROR: Unmatched pairs.\n"
                  "Mate 1: %s\nMate 2: %s.\nPlease make sure that pairs are "
                  "sorted before classification.",
-                 seq1->header.c_str(),
-                 seq2->header.c_str());
+                 a->header.c_str(), b->header.c_str());
           }
         }
-        if (! valid_fragment)
-          break;
-        thread_stats.total_sequences++;
-        if (opts.minimum_quality_score > 0) {
-          MaskLowQualityBases(*seq1, opts.minimum_quality_score);
-          if (opts.paired_end_processing)
-            MaskLowQualityBases(*seq2, opts.minimum_quality_score);
-        }
-        taxid_t call;
-        if (opts.paired_end_processing) {
-          call =
-              ClassifySequence(*seq1, *seq2, kraken_oss, hash, tax, idx_opts,
-                               opts, thread_stats, scanner, taxa, hit_counts,
-                               translated_frames, thread_taxon_counters);
-        } else {
-          auto empty_sequence = Sequence();
-          call = ClassifySequence(*seq1, empty_sequence, kraken_oss, hash, tax, idx_opts,
-                                  opts, thread_stats, scanner, taxa, hit_counts,
-                                  translated_frames, thread_taxon_counters);
-        }
-        if (call) {
-          char buffer[1024] = "";
-          sprintf(buffer, " kraken:taxid|%llu",
-              (unsigned long long) tax.nodes()[call].external_id);
-          seq1->header += buffer;
-          c1_oss << seq1->to_string();
-          if (opts.paired_end_processing) {
-            seq2->header += buffer;
-            c2_oss << seq2->to_string();
-          }
-        }
-        else {
-          u1_oss << seq1->to_string();
-          if (opts.paired_end_processing)
-            u2_oss << seq2->to_string();
-        }
-        thread_stats.total_bases += seq1->seq.size();
-        if (opts.paired_end_processing)
-          thread_stats.total_bases += seq2->seq.size();
+        frags.push_back(std::make_pair(a, b));
       }
+
+      // Masking rewrites bases in place, so it must precede any scanning.
+      if (opts.minimum_quality_score > 0) {
+        for (size_t i = 0; i < frags.size(); i++) {
+          MaskLowQualityBases(*frags[i].first, opts.minimum_quality_score);
+          if (opts.paired_end_processing)
+            MaskLowQualityBases(*frags[i].second, opts.minimum_quality_score);
+        }
+      }
+
+      // Translated search scans six frames over a different alphabet, and quick
+      // mode stops as soon as it has enough hit groups; neither fits a batched
+      // probe, so both keep the per-read path.
+      const bool batched_path =
+          ! opts.use_translated_search && ! opts.quick_mode;
+      const size_t sub_batch = batched_path ? FRAGMENTS_PER_SUBBATCH : 1;
+      Sequence empty_sequence;
+
+      for (size_t base = 0; base < frags.size(); base += sub_batch) {
+        const size_t lim = std::min(frags.size(), base + sub_batch);
+
+        if (batched_path) {
+          batch_toks.clear();
+          batch_keys.clear();
+          frag_toks.clear();
+          for (size_t i = base; i < lim; i++) {          // phase 1: scan
+            uint32_t t0 = (uint32_t) batch_toks.size();
+            ScanFragmentTokens(*frags[i].first,
+                frags[i].second ? *frags[i].second : empty_sequence,
+                opts, idx_opts, scanner, batch_toks, batch_keys);
+            frag_toks.push_back(std::make_pair(t0, (uint32_t) batch_toks.size()));
+          }
+          batch_vals.assign(batch_keys.size(), 0);       // phase 2: probe
+          if (! batch_keys.empty())
+            hash->GetBatch(batch_keys.data(), batch_vals.data(),
+                           batch_keys.size());
+        }
+
+        for (size_t i = base; i < lim; i++) {            // phase 3: resolve
+          seq1 = frags[i].first;
+          seq2 = frags[i].second;
+          thread_stats.total_sequences++;
+          taxid_t call;
+          if (batched_path) {
+            const std::pair<uint32_t, uint32_t> &r = frag_toks[i - base];
+            call = ResolveFragmentTokens(*seq1,
+                seq2 ? *seq2 : empty_sequence,
+                batch_toks.data() + r.first, r.second - r.first,
+                batch_keys.data(), batch_vals.data(), kraken_oss, tax, opts,
+                thread_stats, taxa, hit_counts, thread_taxon_counters);
+          }
+          else {
+            call = ClassifySequence(*seq1, seq2 ? *seq2 : empty_sequence,
+                kraken_oss, hash, tax, idx_opts, opts, thread_stats, scanner,
+                taxa, hit_counts, translated_frames, thread_taxon_counters);
+          }
+          if (call) {
+            char buffer[1024] = "";
+            sprintf(buffer, " kraken:taxid|%llu",
+                (unsigned long long) tax.nodes()[call].external_id);
+            seq1->header += buffer;
+            c1_oss << seq1->to_string();
+            if (opts.paired_end_processing) {
+              seq2->header += buffer;
+              c2_oss << seq2->to_string();
+            }
+          }
+          else {
+            u1_oss << seq1->to_string();
+            if (opts.paired_end_processing)
+              u2_oss << seq2->to_string();
+          }
+          thread_stats.total_bases += seq1->seq.size();
+          if (opts.paired_end_processing)
+            thread_stats.total_bases += seq2->seq.size();
+        }  // end phase 3 loop
+      }  // end sub-batch loop
 
       // #pragma omp atomic
       // #pragma omp atomic
@@ -801,6 +856,173 @@ std::string TrimPairInfo(std::string &id) {
   return id;
 }
 
+static taxid_t FinishClassification(Sequence &dna, Sequence &dna2,
+    ostringstream &koss, Taxonomy &taxonomy, Options &opts,
+    ClassificationStats &stats, vector<taxid_t> &taxa,
+    taxon_counts_t &hit_counts, int64_t minimizer_hit_groups,
+    taxon_counters_t &curr_taxon_counts);
+
+// Phase 1 for one fragment, appending into buffers shared by a whole sub-batch.
+// Batching probes across thousands of fragments rather than within a single one
+// is what makes the prefetch in GetBatch effective: a 2x150 fragment yields only
+// about five distinct minimizers needing a lookup, fewer than the prefetch
+// distance, so a per-fragment batch never has anything in flight to overlap.
+static void ScanFragmentTokens(Sequence &dna, Sequence &dna2, Options &opts,
+    IndexOptions &idx_opts, MinimizerScanner &scanner,
+    vector<MinToken> &tok_stream, vector<uint64_t> &lookup_keys)
+{
+  uint64_t *minimizer_ptr;
+  for (int mate_num = 0; mate_num < 2; mate_num++) {
+    if (mate_num == 1 && ! opts.paired_end_processing)
+      break;
+    scanner.LoadSequence(mate_num == 0 ? dna.seq : dna2.seq);
+    uint64_t last_minimizer = UINT64_MAX;
+    while ((minimizer_ptr = scanner.NextMinimizer()) != nullptr) {
+      if (scanner.is_ambiguous()) {
+        tok_stream.push_back({TOK_AMBIG, 0});
+      }
+      else if (*minimizer_ptr != last_minimizer) {
+        last_minimizer = *minimizer_ptr;
+        bool skip_lookup = idx_opts.minimum_acceptable_hash_value &&
+            MurmurHash3(*minimizer_ptr) < idx_opts.minimum_acceptable_hash_value;
+        if (skip_lookup) {
+          tok_stream.push_back({TOK_SKIP, 0});
+        }
+        else {
+          tok_stream.push_back({TOK_LOOKUP, (uint32_t) lookup_keys.size()});
+          lookup_keys.push_back(*minimizer_ptr);
+        }
+      }
+      else {
+        tok_stream.push_back({TOK_REPEAT, 0});
+      }
+    }
+    if (opts.paired_end_processing && mate_num == 0)
+      tok_stream.push_back({TOK_BORDER_MATE, 0});
+  }
+}
+
+// Phase 3 for one fragment: replay its slice of the token stream against the
+// values the batched probe produced.
+static taxid_t ResolveFragmentTokens(Sequence &dna, Sequence &dna2,
+    const MinToken *toks, size_t tok_count, const uint64_t *lookup_keys,
+    const hvalue_t *lookup_vals, ostringstream &koss, Taxonomy &taxonomy,
+    Options &opts, ClassificationStats &stats, vector<taxid_t> &taxa,
+    taxon_counts_t &hit_counts, taxon_counters_t &curr_taxon_counts)
+{
+  taxa.clear();
+  hit_counts.clear();
+  int64_t minimizer_hit_groups = 0;
+  const bool want_counters = ! opts.report_filename.empty() ||
+      ! opts.taxon_counters_dump_filename.empty();
+  taxid_t last_taxon = 0;
+
+  for (size_t ti = 0; ti < tok_count; ti++) {
+    const MinToken &tok = toks[ti];
+    taxid_t taxon = 0;
+    switch (tok.kind) {
+      case TOK_AMBIG:
+        taxa.push_back(AMBIGUOUS_SPAN_TAXON);
+        continue;
+      case TOK_BORDER_FRAME:
+        taxa.push_back(READING_FRAME_BORDER_TAXON);
+        continue;
+      case TOK_BORDER_MATE:
+        taxa.push_back(MATE_PAIR_BORDER_TAXON);
+        continue;
+      case TOK_SKIP:
+        taxon = 0;
+        last_taxon = 0;
+        break;
+      case TOK_LOOKUP:
+        taxon = lookup_vals[tok.key_idx];
+        last_taxon = taxon;
+        if (taxon) {
+          minimizer_hit_groups++;
+          if (want_counters)
+            curr_taxon_counts[taxon].add_kmer(lookup_keys[tok.key_idx]);
+        }
+        break;
+      default:  // TOK_REPEAT
+        taxon = last_taxon;
+        break;
+    }
+    if (taxon)
+      hit_counts[taxon]++;
+    taxa.push_back(taxon);
+  }
+
+  return FinishClassification(dna, dna2, koss, taxonomy, opts, stats, taxa,
+      hit_counts, minimizer_hit_groups, curr_taxon_counts);
+}
+
+// Resolve, count and emit one fragment's result.  Shared by the per-read path
+// and the batched path so their behavior cannot drift apart.
+static taxid_t FinishClassification(Sequence &dna, Sequence &dna2,
+    ostringstream &koss, Taxonomy &taxonomy, Options &opts,
+    ClassificationStats &stats, vector<taxid_t> &taxa,
+    taxon_counts_t &hit_counts, int64_t minimizer_hit_groups,
+    taxon_counters_t &curr_taxon_counts)
+{
+  taxid_t call = 0;
+
+  auto total_kmers = taxa.size();
+  if (opts.paired_end_processing)
+    total_kmers--;  // account for the mate pair marker
+  if (opts.use_translated_search)  // account for reading frame markers
+    total_kmers -= opts.paired_end_processing ? 4 : 2;
+  call = ResolveTree(hit_counts, taxonomy, total_kmers, opts);
+  // Void a call made by too few minimizer groups
+  if (call && minimizer_hit_groups < opts.minimum_hit_groups)
+    call = 0;
+
+  if (call) {
+    stats.total_classified++;
+    if (!opts.report_filename.empty() || !opts.taxon_counters_dump_filename.empty())
+      curr_taxon_counts[call].incrementReadCount();
+  }
+
+  if (call)
+    koss << "C\t";
+  else
+    koss << "U\t";
+  if (! opts.paired_end_processing)
+    koss << dna.header << "\t";
+  else
+    koss << TrimPairInfo(dna.header) << "\t";
+
+  auto ext_call = taxonomy.nodes()[call].external_id;
+  if (opts.print_scientific_name) {
+    const char *name = nullptr;
+    if (call) {
+      name = taxonomy.name_data() + taxonomy.nodes()[call].name_offset;
+    }
+    koss << (name ? name : "unclassified") << " (taxid " << ext_call << ")";
+  }
+  else {
+    koss << ext_call;
+  }
+
+  koss << "\t";
+  if (! opts.paired_end_processing)
+    koss << dna.seq.size() << "\t";
+  else
+    koss << dna.seq.size() << "|" << dna2.seq.size() << "\t";
+
+  if (opts.quick_mode) {
+    koss << ext_call << ":Q";
+  }
+  else {
+    if (taxa.empty())
+      koss << "0:0";
+    else
+      AddHitlistString(koss, taxa, taxonomy);
+  }
+
+  koss << endl;
+  return call;
+}
+
 taxid_t ClassifySequence(Sequence &dna, Sequence &dna2, ostringstream &koss,
                          KeyValueStore *hash, Taxonomy &taxonomy,
                          IndexOptions &idx_opts, Options &opts,
@@ -920,63 +1142,8 @@ taxid_t ClassifySequence(Sequence &dna, Sequence &dna2, ostringstream &koss,
   }
 
   finished_searching:
-
-  auto total_kmers = taxa.size();
-  if (opts.paired_end_processing)
-    total_kmers--;  // account for the mate pair marker
-  if (opts.use_translated_search)  // account for reading frame markers
-    total_kmers -= opts.paired_end_processing ? 4 : 2;
-  call = ResolveTree(hit_counts, taxonomy, total_kmers, opts);
-  // Void a call made by too few minimizer groups
-  if (call && minimizer_hit_groups < opts.minimum_hit_groups)
-    call = 0;
-
-  if (call) {
-    stats.total_classified++;
-    if (!opts.report_filename.empty() || !opts.taxon_counters_dump_filename.empty())
-      curr_taxon_counts[call].incrementReadCount();
-  }
-
-  if (call)
-    koss << "C\t";
-  else
-    koss << "U\t";
-  if (! opts.paired_end_processing)
-    koss << dna.header << "\t";
-  else
-    koss << TrimPairInfo(dna.header) << "\t";
-
-  auto ext_call = taxonomy.nodes()[call].external_id;
-  if (opts.print_scientific_name) {
-    const char *name = nullptr;
-    if (call) {
-      name = taxonomy.name_data() + taxonomy.nodes()[call].name_offset;
-    }
-    koss << (name ? name : "unclassified") << " (taxid " << ext_call << ")";
-  }
-  else {
-    koss << ext_call;
-  }
-
-  koss << "\t";
-  if (! opts.paired_end_processing)
-    koss << dna.seq.size() << "\t";
-  else
-    koss << dna.seq.size() << "|" << dna2.seq.size() << "\t";
-
-  if (opts.quick_mode) {
-    koss << ext_call << ":Q";
-  }
-  else {
-    if (taxa.empty())
-      koss << "0:0";
-    else
-      AddHitlistString(koss, taxa, taxonomy);
-  }
-
-  koss << endl;
-
-  return call;
+  return FinishClassification(dna, dna2, koss, taxonomy, opts, stats,
+      taxa, hit_counts, minimizer_hit_groups, curr_taxon_counts);
 }
 
 void AddHitlistString(ostringstream &oss, vector<taxid_t> &taxa,
