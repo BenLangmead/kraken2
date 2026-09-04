@@ -60,8 +60,10 @@ threads, so this is a correctness report rather than a performance one.
 
 ## 2. Removing the per-position return from `NextMinimizer` changed the meaning of the hitlist and of `--confidence`
 
-`src/mmscanner.cc`, in `NextMinimizer`, commit 6812347 ("Speed up processing of
-sequences across all kraken2 operations"):
+`src/mmscanner.cc`, in `NextMinimizer`. `git blame` attributes the commenting-out
+to `720f3718`, Rone Charles, 2026-08-27, "Add support for report-minimizer-data
+when doing multi-database classification" (only the comment line above it is
+older, from Derrick Wood in 2020):
 
 ```cpp
     // Return only if we've read in at least one k-mer's worth of chars
@@ -93,6 +95,15 @@ Measured effect on 100k simulated pairs against `pluspf_16_GB`:
 
 Identical at `-T 0`, as expected, and diverging by about 3 percentage points at
 `-T 0.1`. The Kraken 2 paper defines the confidence score over k-mers, which is the
-older behavior. Nothing in the changelog mentions the change, and the surrounding
-commented-out `// queue_.erase(queue_.begin());` suggests the intent was purely to
-cut scanner call overhead rather than to redefine the score.
+older behavior, and nothing in the changelog mentions the change.
+
+The commit it comes from is about minimizer-data reporting, so returning once per
+distinct minimizer may well be deliberate for that purpose; what appears
+unintended is that the same counter drives the hitlist and the `--confidence`
+denominator. The commit also carries work-in-progress markers: the `break` is
+commented out rather than removed, and a commented-out `main()` is left at the
+bottom of the file containing a debug sequence and a loop that counts how many
+minimizers the scanner emits. It bundles a real fix too, `lmer_ = 0` in
+`LoadSequence`, which had been leaking l-mer bits across sequences. At the time of
+writing the commit is eight days old, so this may not be in a release yet, and
+asking what was intended is more useful than filing it as a defect.
