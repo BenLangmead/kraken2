@@ -10,7 +10,7 @@ set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
 OUTDIR="${1:-$HOME/kraken2-gpu-work/bin}"
 CXX="${CXX:-g++}"
-CXXFLAGS="${CXXFLAGS:--fopenmp -Wall -std=c++11 -O3 -DLINEAR_PROBING}"
+CXXFLAGS="${CXXFLAGS:--fopenmp -Wall -std=c++11 -O3 -fPIC -DLINEAR_PROBING}"
 MAXLEVEL=6
 
 mkdir -p "$OUTDIR"
@@ -19,7 +19,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 SHARED_SRCS="reports.cc hyperloglogplus.cc mmap_file.cc compact_hash.cc \
 taxonomy.cc seqreader.cc mmscanner.cc omp_hack.cc aa_translate.cc utilities.cc \
-fast_reader.cc"
+libtax.cc fast_reader.cc"
 
 echo "building level-independent objects..."
 SHARED_OBJS=""

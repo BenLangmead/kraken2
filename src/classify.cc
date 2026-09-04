@@ -14,6 +14,7 @@
 #include "taxonomy.h"
 #include "seqreader.h"
 #include "fast_reader.h"
+#include "k2_profile.h"
 #include "mmscanner.h"
 #include "compact_hash.h"
 #include "kraken2_data.h"
@@ -37,6 +38,45 @@ static const size_t INPUT_BLOCK_BYTES = 8 * 1024 * 1024;
 // Small enough that a sub-batch's token stream stays cache resident, large
 // enough that its probes give the prefetcher plenty to overlap.
 static const size_t FRAGMENTS_PER_SUBBATCH = 4096;
+
+// Mate headers agree once any trailing /1 or /2 is discounted.
+static bool MatesAgree(const SeqView &a, const SeqView &b) {
+  uint32_t la = a.header_len, lb = b.header_len;
+  if (la > 2 && a.header[la - 2] == '/' &&
+      (a.header[la - 1] == '1' || a.header[la - 1] == '2')) la -= 2;
+  if (lb > 2 && b.header[lb - 2] == '/' &&
+      (b.header[lb - 1] == '1' || b.header[lb - 1] == '2')) lb -= 2;
+  return la == lb && memcmp(a.header, b.header, la) == 0;
+}
+
+// Re-emits a record from its view, appending a suffix to the header line.
+static void WriteSeqView(ostringstream &oss, const SeqView &v,
+                         const char *header_suffix) {
+  oss << (v.format == FORMAT_FASTQ ? '@' : '>');
+  oss.write(v.header, v.header_len);
+  if (v.comment_len) {
+    oss << ' ';
+    oss.write(v.comment, v.comment_len);
+  }
+  oss << header_suffix << "\n";
+  oss.write(v.seq, v.seq_len);
+  oss << "\n";
+  if (v.format == FORMAT_FASTQ) {
+    oss << "+\n";
+    oss.write(v.quals, v.quals_len);
+    oss << "\n";
+  }
+}
+
+// Masks in place over the reader's buffer.
+static void MaskLowQualityBases(const SeqView &v, int minimum_quality_score) {
+  if (v.quals == nullptr)
+    return;
+  char *seq = v.seq_mutable();
+  for (uint32_t i = 0; i < v.seq_len; i++)
+    if ((v.quals[i] - '!') < minimum_quality_score)
+      seq[i] = 'x';
+}
 static const taxid_t MATE_PAIR_BORDER_TAXON = TAXID_MAX;
 static const taxid_t READING_FRAME_BORDER_TAXON = TAXID_MAX - 1;
 static const taxid_t AMBIGUOUS_SPAN_TAXON = TAXID_MAX - 2;
@@ -158,7 +198,7 @@ void ProcessFiles(const char *filename1, const char *filename2,
     KeyValueStore *hash, Taxonomy &tax,
     IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
     OutputStreamData &outputs, taxon_counters_t &total_taxon_counters);
-taxid_t ClassifySequence(Sequence &dna, Sequence &dna2, ostringstream &koss,
+taxid_t ClassifySequence(const SeqView &dna, const SeqView &dna2, ostringstream &koss,
     KeyValueStore *hash, Taxonomy &tax, IndexOptions &idx_opts,
     Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
     vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
@@ -171,10 +211,10 @@ void ReportStats(struct timeval time1, struct timeval time2,
     ClassificationStats &stats);
 void InitializeOutputs(Options &opts, OutputStreamData &outputs, SequenceFormat format);
 void MaskLowQualityBases(Sequence &dna, int minimum_quality_score);
-static void ScanFragmentTokens(Sequence &dna, Sequence &dna2, Options &opts,
+static void ScanFragmentTokens(const SeqView &dna, const SeqView &dna2, Options &opts,
     IndexOptions &idx_opts, MinimizerScanner &scanner,
     vector<MinToken> &tok_stream, vector<uint64_t> &lookup_keys);
-static taxid_t ResolveFragmentTokens(Sequence &dna, Sequence &dna2,
+static taxid_t ResolveFragmentTokens(const SeqView &dna, const SeqView &dna2,
     const MinToken *toks, size_t tok_count, const uint64_t *lookup_keys,
     const hvalue_t *lookup_vals, ostringstream &koss, Taxonomy &taxonomy,
     Options &opts, ClassificationStats &stats, vector<taxid_t> &taxa,
@@ -537,10 +577,10 @@ void ProcessFiles(const char *filename1, const char *filename2,
     ostringstream kraken_oss, c1_oss, c2_oss, u1_oss, u2_oss;
     ClassificationStats thread_stats = {0, 0, 0};
     vector<string> translated_frames(6);
-    Sequence *seq1 = nullptr, *seq2 = nullptr;
+    SeqView *seq1 = nullptr, *seq2 = nullptr;
     FastReader reader1, reader2;
     size_t idx1 = 0, idx2 = 0;
-    vector<std::pair<Sequence *, Sequence *> > frags;
+    vector<std::pair<SeqView *, SeqView *> > frags;
     vector<MinToken> batch_toks;
     vector<uint64_t> batch_keys;
     vector<hvalue_t> batch_vals;
@@ -585,6 +625,11 @@ void ProcessFiles(const char *filename1, const char *filename2,
         reader2.Parse();
       idx1 = idx2 = 0;
 
+      // printing_sequences gates whether records are emitted below, so the
+      // outputs must be opened before the first block is classified.
+      if (! outputs.initialized)
+        InitializeOutputs(opts, outputs, reader1.file_format());
+
       // Reset all dynamically-growing things
       kraken_oss.str("");
       c1_oss.str("");
@@ -606,7 +651,7 @@ void ProcessFiles(const char *filename1, const char *filename2,
       // probes of thousands of reads can be issued together.
       frags.clear();
       while (idx1 < reader1.size()) {
-        Sequence *a = &reader1.at(idx1++), *b = nullptr;
+        SeqView *a = &reader1.at(idx1++), *b = nullptr;
         if (opts.paired_end_processing) {
           if (opts.single_file_pairs) {
             if (idx1 >= reader1.size()) break;
@@ -615,11 +660,12 @@ void ProcessFiles(const char *filename1, const char *filename2,
             if (idx2 >= reader2.size()) break;
             b = &reader2.at(idx2++);
           }
-          if (!a->compare_header(b->header)) {
+          if (! MatesAgree(*a, *b)) {
             errx(1, "ERROR: Unmatched pairs.\n"
-                 "Mate 1: %s\nMate 2: %s.\nPlease make sure that pairs are "
-                 "sorted before classification.",
-                 a->header.c_str(), b->header.c_str());
+                 "Mate 1: %.*s\nMate 2: %.*s.\nPlease make sure that pairs "
+                 "are sorted before classification.",
+                 (int) a->header_len, a->header,
+                 (int) b->header_len, b->header);
           }
         }
         frags.push_back(std::make_pair(a, b));
@@ -640,7 +686,8 @@ void ProcessFiles(const char *filename1, const char *filename2,
       const bool batched_path =
           ! opts.use_translated_search && ! opts.quick_mode;
       const size_t sub_batch = batched_path ? FRAGMENTS_PER_SUBBATCH : 1;
-      Sequence empty_sequence;
+      static const SeqView empty_sequence = { nullptr, nullptr, nullptr, nullptr,
+                                              0, 0, 0, 0, FORMAT_FASTQ };
 
       for (size_t base = 0; base < frags.size(); base += sub_batch) {
         const size_t lim = std::min(frags.size(), base + sub_batch);
@@ -657,9 +704,11 @@ void ProcessFiles(const char *filename1, const char *filename2,
             frag_toks.push_back(std::make_pair(t0, (uint32_t) batch_toks.size()));
           }
           batch_vals.assign(batch_keys.size(), 0);       // phase 2: probe
+#if K2_HAVE_PROBE
           if (! batch_keys.empty())
             hash->GetBatch(batch_keys.data(), batch_vals.data(),
                            batch_keys.size());
+#endif
         }
 
         for (size_t i = base; i < lim; i++) {            // phase 3: resolve
@@ -680,25 +729,18 @@ void ProcessFiles(const char *filename1, const char *filename2,
                 kraken_oss, hash, tax, idx_opts, opts, thread_stats, scanner,
                 taxa, hit_counts, translated_frames, thread_taxon_counters);
           }
-          if (call) {
-            char buffer[1024] = "";
-            sprintf(buffer, " kraken:taxid|%llu",
-                (unsigned long long) tax.nodes()[call].external_id);
-            seq1->header += buffer;
-            c1_oss << seq1->to_string();
-            if (opts.paired_end_processing) {
-              seq2->header += buffer;
-              c2_oss << seq2->to_string();
-            }
-          }
-          else {
-            u1_oss << seq1->to_string();
+          if (outputs.printing_sequences) {
+            char buffer[64] = "";
+            if (call)
+              sprintf(buffer, " kraken:taxid|%llu",
+                  (unsigned long long) tax.nodes()[call].external_id);
+            WriteSeqView(call ? c1_oss : u1_oss, *seq1, call ? buffer : "");
             if (opts.paired_end_processing)
-              u2_oss << seq2->to_string();
+              WriteSeqView(call ? c2_oss : u2_oss, *seq2, call ? buffer : "");
           }
-          thread_stats.total_bases += seq1->seq.size();
+          thread_stats.total_bases += seq1->seq_len;
           if (opts.paired_end_processing)
-            thread_stats.total_bases += seq2->seq.size();
+            thread_stats.total_bases += seq2->seq_len;
         }  // end phase 3 loop
       }  // end sub-batch loop
 
@@ -715,10 +757,6 @@ void ProcessFiles(const char *filename1, const char *filename2,
         if (isatty(fileno(stderr)))
           cerr << "\rProcessed " << stats.total_sequences
                << " sequences (" << stats.total_bases << " bp) ...";
-      }
-
-      if (!outputs.initialized) {
-        InitializeOutputs(opts, outputs, reader1.file_format());
       }
 
       out_data.block_id = block_id;
@@ -866,7 +904,7 @@ std::string TrimPairInfo(std::string &id) {
   return id;
 }
 
-static taxid_t FinishClassification(Sequence &dna, Sequence &dna2,
+static taxid_t FinishClassification(const SeqView &dna, const SeqView &dna2,
     ostringstream &koss, Taxonomy &taxonomy, Options &opts,
     ClassificationStats &stats, vector<taxid_t> &taxa,
     taxon_counts_t &hit_counts, int64_t minimizer_hit_groups,
@@ -877,7 +915,7 @@ static taxid_t FinishClassification(Sequence &dna, Sequence &dna2,
 // is what makes the prefetch in GetBatch effective: a 2x150 fragment yields only
 // about five distinct minimizers needing a lookup, fewer than the prefetch
 // distance, so a per-fragment batch never has anything in flight to overlap.
-static void ScanFragmentTokens(Sequence &dna, Sequence &dna2, Options &opts,
+static void ScanFragmentTokens(const SeqView &dna, const SeqView &dna2, Options &opts,
     IndexOptions &idx_opts, MinimizerScanner &scanner,
     vector<MinToken> &tok_stream, vector<uint64_t> &lookup_keys)
 {
@@ -885,7 +923,9 @@ static void ScanFragmentTokens(Sequence &dna, Sequence &dna2, Options &opts,
   for (int mate_num = 0; mate_num < 2; mate_num++) {
     if (mate_num == 1 && ! opts.paired_end_processing)
       break;
-    scanner.LoadSequence(mate_num == 0 ? dna.seq : dna2.seq);
+#if K2_HAVE_SCAN
+    const SeqView &m = (mate_num == 0) ? dna : dna2;
+    scanner.LoadSequence(m.seq, m.seq_len);
     uint64_t last_minimizer = UINT64_MAX;
     while ((minimizer_ptr = scanner.NextMinimizer()) != nullptr) {
       if (scanner.is_ambiguous()) {
@@ -907,6 +947,16 @@ static void ScanFragmentTokens(Sequence &dna, Sequence &dna2, Options &opts,
         tok_stream.push_back({TOK_REPEAT, 0});
       }
     }
+#else
+    {  // parse floor: still stream every base, do no minimizer work
+      const SeqView &m = (mate_num == 0) ? dna : dna2;
+      uint64_t acc = 0;
+      for (uint32_t i = 0; i < m.seq_len; i++)
+        acc += (unsigned char) m.seq[i];
+      k2_ablation_sink += acc;
+    }
+    (void) minimizer_ptr;
+#endif
     if (opts.paired_end_processing && mate_num == 0)
       tok_stream.push_back({TOK_BORDER_MATE, 0});
   }
@@ -914,7 +964,7 @@ static void ScanFragmentTokens(Sequence &dna, Sequence &dna2, Options &opts,
 
 // Phase 3 for one fragment: replay its slice of the token stream against the
 // values the batched probe produced.
-static taxid_t ResolveFragmentTokens(Sequence &dna, Sequence &dna2,
+static taxid_t ResolveFragmentTokens(const SeqView &dna, const SeqView &dna2,
     const MinToken *toks, size_t tok_count, const uint64_t *lookup_keys,
     const hvalue_t *lookup_vals, ostringstream &koss, Taxonomy &taxonomy,
     Options &opts, ClassificationStats &stats, vector<taxid_t> &taxa,
@@ -958,8 +1008,12 @@ static taxid_t ResolveFragmentTokens(Sequence &dna, Sequence &dna2,
           minimizer_hit_groups++;
           if (want_counters) {
             READCOUNTER &rc = curr_taxon_counts[taxon];
+#if K2_HAVE_HLL
             if (want_kmer_sketch)
               rc.add_kmer(lookup_keys[tok.key_idx]);
+#else
+            (void) rc;
+#endif
           }
         }
         break;
@@ -967,9 +1021,11 @@ static taxid_t ResolveFragmentTokens(Sequence &dna, Sequence &dna2,
         taxon = last_taxon;
         break;
     }
+#if K2_HAVE_COUNTERS
     if (taxon)
       hit_counts[taxon]++;
     taxa.push_back(taxon);
+#endif
   }
 
   return FinishClassification(dna, dna2, koss, taxonomy, opts, stats, taxa,
@@ -978,7 +1034,7 @@ static taxid_t ResolveFragmentTokens(Sequence &dna, Sequence &dna2,
 
 // Resolve, count and emit one fragment's result.  Shared by the per-read path
 // and the batched path so their behavior cannot drift apart.
-static taxid_t FinishClassification(Sequence &dna, Sequence &dna2,
+static taxid_t FinishClassification(const SeqView &dna, const SeqView &dna2,
     ostringstream &koss, Taxonomy &taxonomy, Options &opts,
     ClassificationStats &stats, vector<taxid_t> &taxa,
     taxon_counts_t &hit_counts, int64_t minimizer_hit_groups,
@@ -991,7 +1047,11 @@ static taxid_t FinishClassification(Sequence &dna, Sequence &dna2,
     total_kmers--;  // account for the mate pair marker
   if (opts.use_translated_search)  // account for reading frame markers
     total_kmers -= opts.paired_end_processing ? 4 : 2;
+#if K2_HAVE_RESOLVE
   call = ResolveTree(hit_counts, taxonomy, total_kmers, opts);
+#else
+  call = hit_counts.empty() ? 0 : hit_counts.begin()->first;
+#endif
   // Void a call made by too few minimizer groups
   if (call && minimizer_hit_groups < opts.minimum_hit_groups)
     call = 0;
@@ -1004,15 +1064,22 @@ static taxid_t FinishClassification(Sequence &dna, Sequence &dna2,
 
   if (! opts.need_kraken_output)
     return call;
+#if ! K2_HAVE_FORMAT
+  return call;
+#endif
 
   if (call)
     koss << "C\t";
   else
     koss << "U\t";
-  if (! opts.paired_end_processing)
-    koss << dna.header << "\t";
-  else
-    koss << TrimPairInfo(dna.header) << "\t";
+  {
+    uint32_t n = dna.header_len;
+    if (opts.paired_end_processing && n > 2 && dna.header[n - 2] == '/' &&
+        (dna.header[n - 1] == '1' || dna.header[n - 1] == '2'))
+      n -= 2;
+    koss.write(dna.header, n);
+    koss << "\t";
+  }
 
   auto ext_call = taxonomy.nodes()[call].external_id;
   if (opts.print_scientific_name) {
@@ -1028,9 +1095,9 @@ static taxid_t FinishClassification(Sequence &dna, Sequence &dna2,
 
   koss << "\t";
   if (! opts.paired_end_processing)
-    koss << dna.seq.size() << "\t";
+    koss << dna.seq_len << "\t";
   else
-    koss << dna.seq.size() << "|" << dna2.seq.size() << "\t";
+    koss << dna.seq_len << "|" << dna2.seq_len << "\t";
 
   if (opts.quick_mode) {
     koss << ext_call << ":Q";
@@ -1046,7 +1113,7 @@ static taxid_t FinishClassification(Sequence &dna, Sequence &dna2,
   return call;
 }
 
-taxid_t ClassifySequence(Sequence &dna, Sequence &dna2, ostringstream &koss,
+taxid_t ClassifySequence(const SeqView &dna, const SeqView &dna2, ostringstream &koss,
                          KeyValueStore *hash, Taxonomy &taxonomy,
                          IndexOptions &idx_opts, Options &opts,
                          ClassificationStats &stats, MinimizerScanner &scanner,
@@ -1074,8 +1141,11 @@ taxid_t ClassifySequence(Sequence &dna, Sequence &dna2, ostringstream &koss,
     if (mate_num == 1 && ! opts.paired_end_processing)
       break;
 
+    const SeqView &mate = (mate_num == 0) ? dna : dna2;
     if (opts.use_translated_search) {
-      TranslateToAllFrames(mate_num == 0 ? dna.seq : dna2.seq, tx_frames);
+      // The translator wants a real string; this path is the rare one.
+      std::string mate_seq(mate.seq, mate.seq_len);
+      TranslateToAllFrames(mate_seq, tx_frames);
     }
     // index of frame is 0 - 5 w/ tx search (or 0 if no tx search)
     for (int frame_idx = 0; frame_idx < frame_ct; frame_idx++) {
@@ -1083,7 +1153,7 @@ taxid_t ClassifySequence(Sequence &dna, Sequence &dna2, ostringstream &koss,
         scanner.LoadSequence(tx_frames[frame_idx]);
       }
       else {
-        scanner.LoadSequence(mate_num == 0 ? dna.seq : dna2.seq);
+        scanner.LoadSequence(mate.seq, mate.seq_len);
       }
       uint64_t last_minimizer = UINT64_MAX;
       while ((minimizer_ptr = scanner.NextMinimizer()) != nullptr) {
