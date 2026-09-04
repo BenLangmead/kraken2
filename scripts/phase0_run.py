@@ -181,10 +181,24 @@ def main():
         print("  Re-run on a quiet machine, or raise --reps.  Not reporting a ceiling.",
               file=sys.stderr)
         sys.exit(2)
-    if worst_spread > 0.15:
-        print("\n  WARNING: worst run-to-run spread %.0f%% exceeds 15%%; treat the"
-              % (100 * worst_spread), file=sys.stderr)
-        print("  ceiling below as indicative only.", file=sys.stderr)
+    # Only L0, L3 and L6 enter the ceiling.  A noisy degenerate level says
+    # nothing about the result's reliability, so warn on what is actually used
+    # and name the level rather than reporting a bare worst case.
+    load_bearing = {0: "L0, the baseline",
+                    3: "L3, the offloadable numerator",
+                    6: "L6, the parse floor"}
+    noisy = [(l, spread_of(l)) for l in load_bearing if spread_of(l) > 0.15]
+    if noisy:
+        print("\n  WARNING: spread exceeds 15%% on a level the ceiling depends on:",
+              file=sys.stderr)
+        for l, sp in noisy:
+            print("    %s: %.0f%%" % (load_bearing[l], 100 * sp), file=sys.stderr)
+        print("  Treat the ceiling below as indicative only.", file=sys.stderr)
+    elif worst_spread > 0.15:
+        loudest = max(range(7), key=spread_of)
+        print("\n  note: worst spread is %.0f%% at L%d, which does not feed the"
+              % (100 * spread_of(loudest), loudest), file=sys.stderr)
+        print("  ceiling; the levels it depends on are within 15%%.", file=sys.stderr)
 
     if ties:
         print("\n  note: %s tie with the level above, i.e. that region is already"
