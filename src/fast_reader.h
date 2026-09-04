@@ -25,6 +25,7 @@
 
 #include "kraken2_headers.h"
 #include "seqreader.h"
+#include "bgzf_index.h"
 
 namespace kraken2 {
 
@@ -59,6 +60,7 @@ struct StreamCursor {
 class FastReader {
   public:
   FastReader();
+  ~FastReader();
 
   // Both loaders must be called with the input lock held, and both leave the
   // reader holding a whole number of records.
@@ -72,6 +74,14 @@ class FastReader {
   // Pulls exactly `records` records, for the second mate of a pair so the two
   // files stay in step.
   bool LoadRecords(int fd, StreamCursor &cur, size_t records);
+
+  // Fills the reader with records [r0, r1) of an indexed, record-aligned BGZF
+  // file.  Unlike the two loaders above this needs no lock and no shared
+  // cursor: the caller has already claimed the range, the blocks holding it are
+  // read with pread, and every block begins on a record boundary.  Whole blocks
+  // are inflated, so the reader may hold records either side of the range;
+  // Parse trims to it.
+  bool LoadBgzfRange(const BgzfIndex &ix, uint64_t r0, uint64_t r1);
 
   // Number of records held, without parsing them.
   size_t RecordCount() const;
@@ -95,6 +105,15 @@ class FastReader {
   std::vector<SeqView> records_;
   size_t record_count_;
   SequenceFormat format_;
+
+  std::vector<char> cbuf_;     // compressed bytes of a claimed BGZF range
+  void *inflater_;             // decompressor, allocated on first BGZF load
+  size_t range_skip_;          // records of the first block preceding the range
+  size_t range_take_;          // records in the range, SIZE_MAX if unbounded
+
+  // Holds a decompressor, so copying would double free it.
+  FastReader(const FastReader &);
+  FastReader &operator=(const FastReader &);
 };
 
 }  // end namespace

@@ -10,6 +10,7 @@
 
 #include "kraken2_headers.h"
 #include <algorithm>
+#include <atomic>
 #include "kv_store.h"
 #include "taxonomy.h"
 #include "seqreader.h"
@@ -38,6 +39,10 @@ static const size_t INPUT_BLOCK_BYTES = 8 * 1024 * 1024;
 // Small enough that a sub-batch's token stream stays cache resident, large
 // enough that its probes give the prefetcher plenty to overlap.
 static const size_t FRAGMENTS_PER_SUBBATCH = 4096;
+
+// Records a thread claims at once from indexed BGZF input.  Roughly a block's
+// worth of bases, small enough that 32 threads still get many claims each.
+static const uint64_t BGZF_RECORDS_PER_CLAIM = 16384;
 
 // Mate headers agree once any trailing /1 or /2 is discounted.
 static bool MatesAgree(const SeqView &a, const SeqView &b) {
@@ -136,8 +141,10 @@ struct Options {
   std::vector<char *> filenames;
   bool daemon_mode;
   bool check_pair_order;
+  bool bgzf_input;
 
   void reset() {
+    bgzf_input = false;
     quick_mode = false;
     confidence_threshold = 0;
     paired_end_processing = false;
@@ -567,6 +574,35 @@ void ProcessFiles(const char *filename1, const char *filename2,
   StreamCursor cursor1, cursor2;
   std::vector<OutputData> buffers(omp_get_max_threads() * 2);
 
+  // Indexed BGZF input replaces the critical section outright.  Threads claim a
+  // record range from a counter and read the blocks holding it themselves, so
+  // neither the read nor the newline scan is serialized, and the two mate files
+  // are indexed independently rather than one being pulled in step behind the
+  // other.
+  BgzfIndex bidx1, bidx2;
+  bool bgzf = false;
+  uint64_t bgzf_records = 0;
+  uint64_t bgzf_chunk = BGZF_RECORDS_PER_CLAIM;
+  std::atomic<uint64_t> next_record(0);
+  if (opts.bgzf_input) {
+    if (! filename1)
+      errx(EX_USAGE, "-Z needs named input files; an indexed BGZF file cannot "
+           "be read from a pipe");
+    if (! bidx1.Open(filename1))
+      errx(EX_NOINPUT, "cannot open %s together with its .k2i index", filename1);
+    bgzf_records = bidx1.records();
+    if (filename2) {
+      if (! bidx2.Open(filename2))
+        errx(EX_NOINPUT, "cannot open %s together with its .k2i index", filename2);
+      if (bidx2.records() < bgzf_records)
+        bgzf_records = bidx2.records();
+    }
+    // An interleaved file must never split a pair across claims.
+    if (opts.paired_end_processing && opts.single_file_pairs && (bgzf_chunk & 1))
+      bgzf_chunk++;
+    bgzf = true;
+  }
+
   #pragma omp parallel
   {
     MinimizerScanner scanner(idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
@@ -596,24 +632,38 @@ void ProcessFiles(const char *filename1, const char *filename2,
 
       auto ok_read = false;
 
-      #pragma omp critical(seqread)
-      {  // Input processing block
-        if (! opts.paired_end_processing) {
-          ok_read = reader1.LoadBlock(fd1, cursor1, INPUT_BLOCK_BYTES);
+      if (bgzf) {
+        uint64_t r0 = next_record.fetch_add(bgzf_chunk);
+        if (r0 < bgzf_records) {
+          uint64_t r1 = r0 + bgzf_chunk;
+          if (r1 > bgzf_records)
+            r1 = bgzf_records;
+          ok_read = reader1.LoadBgzfRange(bidx1, r0, r1);
+          if (ok_read && opts.paired_end_processing && ! opts.single_file_pairs)
+            ok_read = reader2.LoadBgzfRange(bidx2, r0, r1);
+          block_id = r0 / bgzf_chunk;
         }
-        else if (! opts.single_file_pairs) {
-          // Take a block from the first mate, then exactly as many records from
-          // the second, so the two files stay in step.
-          ok_read = reader1.LoadBlock(fd1, cursor1, INPUT_BLOCK_BYTES);
-          if (ok_read)
-            ok_read = reader2.LoadRecords(fd2, cursor2, reader1.RecordCount());
+      }
+      else {
+        #pragma omp critical(seqread)
+        {  // Input processing block
+          if (! opts.paired_end_processing) {
+            ok_read = reader1.LoadBlock(fd1, cursor1, INPUT_BLOCK_BYTES);
+          }
+          else if (! opts.single_file_pairs) {
+            // Take a block from the first mate, then exactly as many records
+            // from the second, so the two files stay in step.
+            ok_read = reader1.LoadBlock(fd1, cursor1, INPUT_BLOCK_BYTES);
+            if (ok_read)
+              ok_read = reader2.LoadRecords(fd2, cursor2, reader1.RecordCount());
+          }
+          else {
+            // Interleaved pairs: cut on an even record count so a pair is never
+            // split across blocks.
+            ok_read = reader1.LoadBlock(fd1, cursor1, INPUT_BLOCK_BYTES, 2);
+          }
+          block_id = next_input_block_id++;
         }
-        else {
-          // Interleaved pairs: cut on an even record count so a pair is never
-          // split across blocks.
-          ok_read = reader1.LoadBlock(fd1, cursor1, INPUT_BLOCK_BYTES, 2);
-        }
-        block_id = next_input_block_id++;
       }
 
       if (! ok_read)
@@ -1366,7 +1416,7 @@ void MaskLowQualityBases(Sequence &dna, int minimum_quality_score) {
 void ParseCommandLine(int argc, char **argv, Options &opts) {
   int opt;
 
-  while ((opt = getopt(argc, argv, "h?H:t:o:T:p:R:C:U:O:Q:g:d:nmzqPSMKDc")) != -1) {
+  while ((opt = getopt(argc, argv, "h?H:t:o:T:p:R:C:U:O:Q:g:d:nmzqPSMKDcZ")) != -1) {
     switch (opt) {
       case 'h' : case '?' :
         usage(0);
@@ -1388,6 +1438,9 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         break;
       case 'q' :
         opts.quick_mode = true;
+        break;
+      case 'Z' :
+        opts.bgzf_input = true;
         break;
       case 'p' :
         opts.num_threads = atoi(optarg);
@@ -1479,6 +1532,7 @@ void usage(int exit_code) {
        << "  -q               Quick mode" << endl
        << "  -c               Ensure pairs are ordered (stop classification otherwise)"
        << "  -M               Use memory mapping to access hash & taxonomy" << endl
+       << "  -Z               Input files are record-aligned BGZF with a .k2i index" << endl
        << "  -T NUM           Confidence score threshold (def. 0)" << endl
        << "  -p NUM           Number of threads (def. 1)" << endl
        << "  -Q NUM           Minimum quality score (FASTQ only, def. 0)" << endl

@@ -7,15 +7,57 @@
 #include <cstring>
 #include <unistd.h>
 
+#ifdef KRAKEN2_ZLIB_INFLATE
+#include <zlib.h>
+#else
+#include <libdeflate.h>
+#endif
+
 namespace kraken2 {
 
 static const size_t REFILL_CHUNK = 1 << 20;
 
 FastReader::FastReader()
-    : scanned_(0), record_count_(0), format_(FORMAT_AUTO_DETECT) {
+    : scanned_(0), record_count_(0), format_(FORMAT_AUTO_DETECT),
+      inflater_(NULL), range_skip_(0), range_take_(SIZE_MAX) {
   buf_.reserve(16 << 20);
   nl_.reserve(1 << 17);
   records_.reserve(1 << 15);
+}
+
+FastReader::~FastReader() {
+  if (! inflater_)
+    return;
+#ifdef KRAKEN2_ZLIB_INFLATE
+  z_stream *zs = (z_stream *) inflater_;
+  inflateEnd(zs);
+  delete zs;
+#else
+  libdeflate_free_decompressor((libdeflate_decompressor *) inflater_);
+#endif
+}
+
+// Inflates one BGZF block, which is a complete gzip member, and reports how
+// many bytes it produced.
+static bool InflateBlock(void *inflater, const unsigned char *in, size_t in_len,
+                         char *out, size_t out_avail, size_t *out_len) {
+#ifdef KRAKEN2_ZLIB_INFLATE
+  z_stream *zs = (z_stream *) inflater;
+  if (inflateReset(zs) != Z_OK)
+    return false;
+  zs->next_in = (Bytef *) in;
+  zs->avail_in = (uInt) in_len;
+  zs->next_out = (Bytef *) out;
+  zs->avail_out = (uInt) out_avail;
+  if (inflate(zs, Z_FINISH) != Z_STREAM_END)
+    return false;
+  *out_len = out_avail - zs->avail_out;
+  return true;
+#else
+  return libdeflate_gzip_decompress((libdeflate_decompressor *) inflater, in,
+                                    in_len, out, out_avail, out_len) ==
+         LIBDEFLATE_SUCCESS;
+#endif
 }
 
 void FastReader::ScanNewlines() {
@@ -69,6 +111,8 @@ static void DetectFormat(StreamCursor &cur, const std::vector<char> &buf) {
 
 bool FastReader::LoadBlock(int fd, StreamCursor &cur, size_t target_bytes,
                            size_t record_multiple) {
+  range_skip_ = 0;
+  range_take_ = SIZE_MAX;
   records_.clear();
   record_count_ = 0;
   buf_.clear();
@@ -128,6 +172,8 @@ bool FastReader::LoadBlock(int fd, StreamCursor &cur, size_t target_bytes,
 }
 
 bool FastReader::LoadRecords(int fd, StreamCursor &cur, size_t records) {
+  range_skip_ = 0;
+  range_take_ = SIZE_MAX;
   records_.clear();
   record_count_ = 0;
   buf_.clear();
@@ -171,6 +217,72 @@ bool FastReader::LoadRecords(int fd, StreamCursor &cur, size_t records) {
     buf_.resize(keep);
     TruncateIndex(keep);
   }
+  return ! buf_.empty();
+}
+
+bool FastReader::LoadBgzfRange(const BgzfIndex &ix, uint64_t r0, uint64_t r1) {
+  records_.clear();
+  record_count_ = 0;
+  // buf_ is deliberately not cleared: resizing up from zero would value
+  // initialize the whole buffer, so every claim would memset several megabytes
+  // before inflating over them.  Resizing from the previous length only zeroes
+  // any growth, which stops once the buffer reaches the largest range seen.
+  nl_.clear();
+  scanned_ = 0;
+  format_ = FORMAT_FASTQ;
+  if (r0 >= r1 || r1 > ix.records())
+    return false;
+
+  uint64_t coff;
+  size_t clen, ulen;
+  ix.Range(r0, r1, &coff, &clen, &ulen, &range_skip_);
+  range_take_ = (size_t) (r1 - r0);
+
+  cbuf_.resize(clen);
+  size_t got = 0;
+  while (got < clen) {
+    ssize_t n = pread(ix.fd(), &cbuf_[0] + got, clen - got, (off_t) (coff + got));
+    if (n <= 0)
+      break;
+    got += (size_t) n;
+  }
+  if (got < clen)
+    errx(EX_IOERR, "short read from indexed BGZF input");
+
+  if (! inflater_) {
+#ifdef KRAKEN2_ZLIB_INFLATE
+    z_stream *zs = new z_stream;
+    memset(zs, 0, sizeof *zs);
+    if (inflateInit2(zs, 15 + 16) != Z_OK)
+      errx(EX_SOFTWARE, "cannot initialize inflate");
+    inflater_ = zs;
+#else
+    inflater_ = libdeflate_alloc_decompressor();
+    if (! inflater_)
+      errx(EX_SOFTWARE, "cannot allocate decompressor");
+#endif
+  }
+
+  buf_.resize(ulen);
+  size_t opos = 0, cpos = 0;
+  while (cpos + 18 <= got) {
+    const unsigned char *p = (const unsigned char *) &cbuf_[0] + cpos;
+    if (p[0] != 0x1f || p[1] != 0x8b)
+      errx(EX_DATAERR, "input is not BGZF at offset %llu",
+           (unsigned long long) (coff + cpos));
+    uint32_t xlen = p[10] | (p[11] << 8);
+    if (xlen != 6 || p[12] != 'B' || p[13] != 'C')
+      errx(EX_DATAERR, "BGZF block lacks its BC field");
+    size_t bsize = (size_t) (p[16] | (p[17] << 8)) + 1;
+    size_t produced = 0;
+    if (! InflateBlock(inflater_, p, bsize, &buf_[0] + opos, buf_.size() - opos,
+                       &produced))
+      errx(EX_DATAERR, "inflate failed on a BGZF block");
+    opos += produced;
+    cpos += bsize;
+  }
+  buf_.resize(opos);
+  ScanNewlines();
   return ! buf_.empty();
 }
 
@@ -232,7 +344,15 @@ void FastReader::Parse() {
       out++;
     }
     records_.resize(out);
-    record_count_ = out;
+    // Whole blocks were inflated, so drop whatever falls outside the range the
+    // caller claimed.
+    if (range_skip_ > 0 || range_take_ != SIZE_MAX) {
+      size_t skip = range_skip_ < records_.size() ? range_skip_ : records_.size();
+      records_.erase(records_.begin(), records_.begin() + skip);
+      if (records_.size() > range_take_)
+        records_.resize(range_take_);
+    }
+    record_count_ = records_.size();
     return;
   }
 
