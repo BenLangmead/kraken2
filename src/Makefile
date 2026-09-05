@@ -74,8 +74,8 @@ k2bgzf: k2bgzf.o
 	$(CXX) $(CXXFLAGS) -o $@ k2bgzf.o $(LDFLAGS) $(KRAKEN2_INFLATE_LIB)
 
 # Reference minimizer stream, used as the oracle when checking a device scan.
-k2mindump: k2mindump.o mmscanner.o fast_reader.o bgzf_index.o seqreader.o omp_hack.o
-	$(CXX) $(CXXFLAGS) -o $@ k2mindump.o mmscanner.o fast_reader.o bgzf_index.o seqreader.o omp_hack.o $(LDFLAGS) $(KRAKEN2_INFLATE_LIB)
+k2mindump: k2mindump.o mmscanner.o fast_reader.o bgzf_index.o seqreader.o omp_hack.o mmap_file.o compact_hash.o
+	$(CXX) $(CXXFLAGS) -o $@ k2mindump.o mmscanner.o fast_reader.o bgzf_index.o seqreader.o omp_hack.o mmap_file.o compact_hash.o $(LDFLAGS) $(KRAKEN2_INFLATE_LIB)
 
 merge: merge.o taxonomy.o reports.o mmap_file.o utilities.o hyperloglogplus.o
 	$(CXX) $(CXXFLAGS) -o $@ merge.o taxonomy.o reports.o mmap_file.o utilities.o hyperloglogplus.o -lc
