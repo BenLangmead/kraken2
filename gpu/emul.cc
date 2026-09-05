@@ -37,6 +37,39 @@ static inline uint64_t revcomp(uint64_t kmer, int n) {
   return ((~kmer) >> (64 - n * 2)) & ((1ULL << (n * 2)) - 1);
 }
 
+// Kraken 2's tree resolution, over the handful of distinct taxa one read hits.
+// A taxon is its own ancestor, so every taxon scores at least its own count and
+// the winning score is never zero.  Ties fold with the lowest common ancestor,
+// which is commutative and associative, so the answer does not depend on the
+// order the taxa are visited -- which matters, because the CPU walks them in
+// the arbitrary order of an unordered_map.
+static inline bool is_ancestor(const uint64_t *parent, uint64_t a, uint64_t b) {
+  if (!a || !b) return false;
+  while (b > a) b = parent[b];
+  return b == a;
+}
+
+static inline uint64_t lca(const uint64_t *parent, uint64_t a, uint64_t b) {
+  if (!a || !b) return a ? a : b;
+  while (a != b) {
+    if (a > b) a = parent[a]; else b = parent[b];
+  }
+  return a;
+}
+
+static uint32_t resolve(const uint64_t *parent, const uint32_t *tax,
+                        const uint32_t *cnt, int n) {
+  uint64_t max_taxon = 0; uint32_t max_score = 0;
+  for (int i = 0; i < n; i++) {
+    uint32_t score = 0;
+    for (int j = 0; j < n; j++)
+      if (is_ancestor(parent, tax[j], tax[i])) score += cnt[j];
+    if (score > max_score) { max_score = score; max_taxon = tax[i]; }
+    else if (score == max_score) max_taxon = lca(parent, max_taxon, tax[i]);
+  }
+  return (uint32_t) max_taxon;
+}
+
 static inline uint32_t probe(const uint32_t *t, uint64_t cap, uint64_t key,
                              int key_bits, int value_bits) {
   uint64_t hc = murmur(key);
@@ -54,11 +87,13 @@ static inline uint32_t probe(const uint32_t *t, uint64_t cap, uint64_t key,
 }
 
 int main(int argc, char **argv) {
-  if (argc < 5) {
-    fprintf(stderr, "usage: emul reads.fq hash.k2d opts.k2d ref.k2mm [reads]\n");
+  if (argc < 6) {
+    fprintf(stderr, "usage: emul reads.fq hash.k2d opts.k2d taxo.k2d oracle [reads]\n"
+                    "  oracle is either a k2mindump file (checks the taxa array)\n"
+                    "  or classify's own output (checks the final call)\n");
     return 1;
   }
-  size_t limit = argc > 5 ? (size_t) atoll(argv[5]) : 50000;
+  size_t limit = argc > 6 ? (size_t) atoll(argv[6]) : 50000;
 
   uint64_t o[8];
   { int fd = open(argv[3], O_RDONLY);
@@ -78,15 +113,44 @@ int main(int argc, char **argv) {
   printf("k=%d l=%d capacity=%" PRIu64 " key_bits=%" PRIu64 " value_bits=%" PRIu64 "\n",
          k, l, cap, key_bits, value_bits);
 
+  // Taxonomy: only the parent and external-id columns are needed.
+  int tf = open(argv[4], O_RDONLY);
+  if (tf < 0) { fprintf(stderr, "cannot open taxonomy %s\n", argv[4]); return 1; }
+  struct stat tst; fstat(tf, &tst);
+  char *tmap = (char *) mmap(nullptr, tst.st_size, PROT_READ, MAP_PRIVATE, tf, 0);
+  if (tmap == MAP_FAILED) { perror("mmap taxo"); return 1; }
+  if (memcmp(tmap, "K2TAXDAT", 8) != 0) { fprintf(stderr, "%s is not a taxonomy\n", argv[4]); return 1; }
+  uint64_t node_count; memcpy(&node_count, tmap + 8, 8);
+  const uint64_t *nodes = (const uint64_t *) (tmap + 32);   // 7 words per node
+  std::vector<uint64_t> parent(node_count), extid(node_count);
+  for (uint64_t i = 0; i < node_count; i++) {
+    parent[i] = nodes[i * 7 + 0];
+    extid[i]  = nodes[i * 7 + 5];
+  }
+  printf("taxonomy: %" PRIu64 " nodes\n", node_count);
+
   FILE *f = fopen(argv[1], "rb");
   if (! f) { fprintf(stderr, "cannot open reads %s\n", argv[1]); return 1; }
-  FILE *rf = fopen(argv[4], "rb");
-  if (! rf) { fprintf(stderr, "cannot open oracle %s\n", argv[4]); return 1; }
+  FILE *rf = fopen(argv[5], "rb");
+  if (! rf) { fprintf(stderr, "cannot open oracle %s\n", argv[5]); return 1; }
+
+  // The oracle is either k2mindump's binary dump or classify's own output.
+  // The second is the one that matters: it checks the call, not an
+  // intermediate.
   char magic[8]; size_t z = fread(magic,1,8,rf); (void) z;
-  char flags; z = fread(&flags,1,1,rf);
-  uint64_t rn; z = fread(&rn,8,1,rf);
-  if (flags != 2 && flags != 3) { fprintf(stderr, "oracle needs -H (flags 2) or -H -T (flags 3)\n"); return 1; }
-  bool taxa_mode = (flags == 3);
+  bool call_mode = (memcmp(magic, "K2MDUMP", 7) != 0);
+  bool taxa_mode = false;
+  uint64_t rn = (uint64_t) -1;
+  if (! call_mode) {
+    char flags; z = fread(&flags,1,1,rf);
+    z = fread(&rn,8,1,rf);
+    if (flags != 2 && flags != 3) { fprintf(stderr, "oracle needs -H or -H -T\n"); return 1; }
+    taxa_mode = (flags == 3);
+  } else {
+    rewind(rf);
+    taxa_mode = true;   // the call is computed from the taxa array
+  }
+  printf("mode: %s\n", call_mode ? "final call vs classify" : "intermediate vs k2mindump");
 
   char line[8192];
   size_t nr = 0, bad = 0, pairs = 0;
@@ -97,7 +161,14 @@ int main(int argc, char **argv) {
   while (nr < limit && nr < rn && fgets(line, sizeof line, f)) {
     if (!fgets(line, sizeof line, f)) break;
     size_t L = strlen(line); while (L && (line[L-1]=='\n'||line[L-1]=='\r')) L--;
-    if ((int) L > MAX_LEN) L = MAX_LEN;
+    if ((int) L > MAX_LEN) {
+      // Truncating would silently misclassify the read.  Shared memory is sized
+      // for MAX_LEN, so a longer read needs a different arrangement, not a
+      // quiet shortening.
+      fprintf(stderr, "read %zu is %zu bases, longer than the %d this build "
+              "handles\n", nr, L, MAX_LEN);
+      return 1;
+    }
     const char *seq = line;
 
     for (size_t i = 0; i < L; i++) {
@@ -188,14 +259,37 @@ int main(int argc, char **argv) {
         gt.push_back(filtered ? 0u
                               : probe(table, cap, val[p], (int) key_bits, (int) value_bits));
       }
-      uint32_t c; if (fread(&c,4,1,rf)!=1) break;
-      bool ok = (c == gt.size());
-      for (uint32_t j = 0; j < c; j++) {
-        uint32_t tax; if (fread(&tax,4,1,rf)!=1) { ok=false; break; }
+      if (call_mode) {
+        // Distinct taxa and their counts, then Kraken 2's tree resolution.
+        uint32_t tx[MAX_LEN]; uint32_t ct[MAX_LEN]; int nd = 0;
+        for (size_t j = 0; j < gt.size(); j++) {
+          if (!gt[j]) continue;
+          int q = 0; while (q < nd && tx[q] != gt[j]) q++;
+          if (q == nd) { tx[nd] = gt[j]; ct[nd] = 1; nd++; } else ct[q]++;
+        }
+        uint32_t call = resolve(&parent[0], tx, ct, nd);
+        uint32_t ext = call ? (uint32_t) extid[call] : 0u;
         pairs++;
-        if (ok && gt[j] != tax) ok = false;
+        char oline[8192];
+        if (!fgets(oline, sizeof oline, rf)) break;
+        unsigned long want = 0;
+        { char *p1 = strchr(oline, '\t');
+          char *p2 = p1 ? strchr(p1 + 1, '\t') : nullptr;
+          if (p2) want = strtoul(p2 + 1, nullptr, 10); }
+        if ((unsigned long) ext != want) {
+          if (bad < 5) fprintf(stderr, "read %zu call differs: classify %lu, emul %u\n", nr, want, ext);
+          bad++;
+        }
+      } else {
+        uint32_t c; if (fread(&c,4,1,rf)!=1) break;
+        bool ok = (c == gt.size());
+        for (uint32_t j = 0; j < c; j++) {
+          uint32_t tax; if (fread(&tax,4,1,rf)!=1) { ok=false; break; }
+          pairs++;
+          if (ok && gt[j] != tax) ok = false;
+        }
+        if (!ok) { if (bad<5) fprintf(stderr,"read %zu taxa differ (cpu %u, emul %zu)\n", nr, c, gt.size()); bad++; }
       }
-      if (!ok) { if (bad<5) fprintf(stderr,"read %zu taxa differ (cpu %u, emul %zu)\n", nr, c, gt.size()); bad++; }
       if (!fgets(line, sizeof line, f)) break;
       if (!fgets(line, sizeof line, f)) break;
       nr++;
@@ -224,7 +318,8 @@ int main(int argc, char **argv) {
     if (!fgets(line, sizeof line, f)) break;
     nr++;
   }
-  printf("emulated %zu reads, %zu lookups: %zu mismatched\n", nr, pairs, bad);
+  printf("emulated %zu reads, %zu %s: %zu mismatched\n", nr, pairs,
+         call_mode ? "calls" : "entries", bad);
   munmap(map, st.st_size); close(hf);
   return bad ? 2 : 0;
 }

@@ -62,6 +62,37 @@ __device__ __forceinline__ uint32_t probe(const uint32_t *__restrict__ table,
   }
 }
 
+__device__ __forceinline__ bool is_ancestor(const uint64_t *__restrict__ parent,
+                                            uint64_t a, uint64_t b) {
+  if (!a || !b) return false;
+  while (b > a) b = parent[b];
+  return b == a;
+}
+
+__device__ __forceinline__ uint64_t lca(const uint64_t *__restrict__ parent,
+                                        uint64_t a, uint64_t b) {
+  if (!a || !b) return a ? a : b;
+  while (a != b) { if (a > b) a = parent[a]; else b = parent[b]; }
+  return a;
+}
+
+// Kraken 2's tree resolution over the few distinct taxa one read hits.  Ties
+// fold with the lowest common ancestor, which is commutative and associative,
+// so the answer does not depend on visiting order -- which matters, because the
+// CPU walks an unordered_map.
+__device__ uint32_t resolve(const uint64_t *__restrict__ parent,
+                            const uint32_t *tax, const uint32_t *cnt, int n) {
+  uint64_t max_taxon = 0; uint32_t max_score = 0;
+  for (int i = 0; i < n; i++) {
+    uint32_t score = 0;
+    for (int j = 0; j < n; j++)
+      if (is_ancestor(parent, tax[j], tax[i])) score += cnt[j];
+    if (score > max_score) { max_score = score; max_taxon = tax[i]; }
+    else if (score == max_score) max_taxon = lca(parent, max_taxon, tax[i]);
+  }
+  return (uint32_t) max_taxon;
+}
+
 __global__ void fused(const char *__restrict__ bases,
                       const uint32_t *__restrict__ offsets,
                       const uint32_t *__restrict__ lengths,
@@ -73,7 +104,10 @@ __global__ void fused(const char *__restrict__ bases,
                       uint64_t *__restrict__ out_key,
                       uint32_t *__restrict__ out_tax,
                       uint32_t *__restrict__ out_count,
-                      const uint32_t *__restrict__ out_offsets) {
+                      const uint32_t *__restrict__ out_offsets,
+                      const uint64_t *__restrict__ parent,
+                      const uint64_t *__restrict__ extid,
+                      uint32_t *__restrict__ out_call) {
   __shared__ uint64_t cand[MAX_LEN];
   __shared__ uint8_t  code[MAX_LEN];
   __shared__ uint64_t val[MAX_LEN];
@@ -81,6 +115,7 @@ __global__ void fused(const char *__restrict__ bases,
   __shared__ int      look[MAX_LEN];
   __shared__ int      scan[MAX_LEN];
   __shared__ int      tmp[MAX_LEN];
+  __shared__ uint32_t stax[MAX_LEN];
 
   for (uint32_t r = blockIdx.x; r < n_reads; r += gridDim.x) {
     const char *seq = bases + offsets[r];
@@ -197,22 +232,40 @@ __global__ void fused(const char *__restrict__ bases,
       }
       bool filtered = min_acceptable && murmur(val[start]) < min_acceptable;
       int slot = scan[p] - 1;
-      out_key[obase + slot] = val[p];
-      out_tax[obase + slot] = filtered
+      uint32_t t = filtered
           ? 0u : probe(table, capacity, val[p], key_bits, value_bits);
+      out_key[obase + slot] = val[p];
+      out_tax[obase + slot] = t;
+      stax[slot] = t;
     }
-    if (threadIdx.x == 0)
-      out_count[r] = n_kmer ? (uint32_t) scan[n_kmer - 1] : 0;
+    __syncthreads();
+    // Counting distinct taxa and resolving the tree is a few dozen operations
+    // on a handful of values, so one thread does it rather than paying for a
+    // reduction across the block.
+    if (threadIdx.x == 0) {
+      int n = n_kmer ? scan[n_kmer - 1] : 0;
+      out_count[r] = (uint32_t) n;
+      uint32_t tx[64], ct[64]; int nd = 0;
+      for (int j = 0; j < n; j++) {
+        uint32_t t = stax[j];
+        if (!t) continue;
+        int q = 0; while (q < nd && tx[q] != t) q++;
+        if (q == nd) { if (nd < 64) { tx[nd] = t; ct[nd] = 1; nd++; } }
+        else ct[q]++;
+      }
+      uint32_t call = resolve(parent, tx, ct, nd);
+      out_call[r] = call ? (uint32_t) extid[call] : 0u;
+    }
     __syncthreads();
   }
 }
 
 int main(int argc, char **argv) {
-  if (argc < 5) {
-    fprintf(stderr, "usage: fused reads.fq hash.k2d opts.k2d ref.k2mm [reads]\n");
+  if (argc < 6) {
+    fprintf(stderr, "usage: fused reads.fq hash.k2d opts.k2d taxo.k2d classify.out [reads]\n");
     return 1;
   }
-  size_t limit = argc > 5 ? (size_t) atoll(argv[5]) : 50000;
+  size_t limit = argc > 6 ? (size_t) atoll(argv[6]) : 50000;
 
   // ---- index options ----
   uint64_t o[8];
@@ -254,6 +307,37 @@ int main(int argc, char **argv) {
   }
   close(hf);
 
+  // ---- taxonomy: only parent and external id are needed ----
+  uint64_t *d_parent = nullptr, *d_extid = nullptr; uint64_t node_count = 0;
+  {
+    int tf = open(argv[4], O_RDONLY);
+    if (tf < 0) { fprintf(stderr, "cannot open taxonomy %s\n", argv[4]); return 1; }
+    char hdr[32];
+    if (read(tf, hdr, 32) < 32 || memcmp(hdr, "K2TAXDAT", 8) != 0) {
+      fprintf(stderr, "%s is not a taxonomy\n", argv[4]); return 1;
+    }
+    memcpy(&node_count, hdr + 8, 8);
+    std::vector<uint64_t> raw(node_count * 7);
+    size_t want = raw.size() * 8, got = 0;
+    while (got < want) {
+      ssize_t n = pread(tf, (char *) raw.data() + got, want - got, 32 + got);
+      if (n <= 0) break;
+      got += n;
+    }
+    close(tf);
+    std::vector<uint64_t> par(node_count), ext(node_count);
+    for (uint64_t i = 0; i < node_count; i++) {
+      par[i] = raw[i * 7 + 0];
+      ext[i] = raw[i * 7 + 5];
+    }
+    CK(cudaMalloc(&d_parent, node_count * 8));
+    CK(cudaMalloc(&d_extid,  node_count * 8));
+    CK(cudaMemcpy(d_parent, par.data(), node_count * 8, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_extid,  ext.data(), node_count * 8, cudaMemcpyHostToDevice));
+    printf("taxonomy: %" PRIu64 " nodes, %.1f MB uploaded\n",
+           node_count, node_count * 16 / 1e6);
+  }
+
   // ---- reads ----
   FILE *f = fopen(argv[1], "rb");
   if (! f) { fprintf(stderr, "cannot open reads %s\n", argv[1]); return 1; }
@@ -262,6 +346,11 @@ int main(int argc, char **argv) {
   while (nr < limit && fgets(line, sizeof line, f)) {
     if (!fgets(line, sizeof line, f)) break;
     size_t L = strlen(line); while (L && (line[L-1]=='\n'||line[L-1]=='\r')) L--;
+    if ((int) L > MAX_LEN) {
+      fprintf(stderr, "read %zu is %zu bases, longer than the %d this build "
+              "handles\n", nr, L, MAX_LEN);
+      return 1;
+    }
     offs.push_back((uint32_t) bases.size()); lens.push_back((uint32_t) L);
     bases.insert(bases.end(), line, line + L);
     if (!fgets(line, sizeof line, f)) break;
@@ -282,6 +371,7 @@ int main(int argc, char **argv) {
   CK(cudaMalloc(&d_b, bases.size())); CK(cudaMalloc(&d_o, nr*4));
   CK(cudaMalloc(&d_l, nr*4)); CK(cudaMalloc(&d_oo, (nr+1)*4));
   CK(cudaMalloc(&d_key, tot*8)); CK(cudaMalloc(&d_tax, tot*4)); CK(cudaMalloc(&d_cnt, nr*4));
+  uint32_t *d_call; CK(cudaMalloc(&d_call, nr*4));
   CK(cudaMemcpy(d_b, bases.data(), bases.size(), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(d_o, offs.data(), nr*4, cudaMemcpyHostToDevice));
   CK(cudaMemcpy(d_l, lens.data(), nr*4, cudaMemcpyHostToDevice));
@@ -290,7 +380,7 @@ int main(int argc, char **argv) {
   int blocks = 8192;
   fused<<<blocks, THREADS>>>(d_b,d_o,d_l,(uint32_t)nr,k,l,ssm,tog,mahv,
                              d_table,capacity,(int)key_bits,(int)value_bits,
-                             d_key,d_tax,d_cnt,d_oo);
+                             d_key,d_tax,d_cnt,d_oo,d_parent,d_extid,d_call);
   CK(cudaDeviceSynchronize());
 
   cudaEvent_t a,b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
@@ -299,37 +389,35 @@ int main(int argc, char **argv) {
   for (int i = 0; i < reps; i++)
     fused<<<blocks, THREADS>>>(d_b,d_o,d_l,(uint32_t)nr,k,l,ssm,tog,mahv,
                                d_table,capacity,(int)key_bits,(int)value_bits,
-                               d_key,d_tax,d_cnt,d_oo);
+                               d_key,d_tax,d_cnt,d_oo,d_parent,d_extid,d_call);
   CK(cudaEventRecord(b)); CK(cudaDeviceSynchronize());
   float ms=0; cudaEventElapsedTime(&ms,a,b); ms/=reps;
   printf("\nfused scan+filter+probe   %.2f ms   %.2f Mbase/s   %.1f Mread/s\n",
          ms, bases.size()/(ms/1000.0)/1e6, nr/(ms/1000.0)/1e6);
 
-  // ---- verify ----
-  std::vector<uint64_t> hk(tot); std::vector<uint32_t> ht(tot), hc(nr);
-  CK(cudaMemcpy(hk.data(), d_key, tot*8, cudaMemcpyDeviceToHost));
-  CK(cudaMemcpy(ht.data(), d_tax, tot*4, cudaMemcpyDeviceToHost));
-  CK(cudaMemcpy(hc.data(), d_cnt, nr*4, cudaMemcpyDeviceToHost));
+  // ---- verify against classify's own calls ----
+  std::vector<uint32_t> hcall(nr);
+  CK(cudaMemcpy(hcall.data(), d_call, nr*4, cudaMemcpyDeviceToHost));
 
-  FILE *rf = fopen(argv[4], "rb");
-  if (! rf) { fprintf(stderr, "cannot open oracle %s\n", argv[4]); return 1; }
-  char magic[8]; size_t z = fread(magic,1,8,rf); (void)z;
-  char flags; z = fread(&flags,1,1,rf);
-  uint64_t rn; z = fread(&rn,8,1,rf);
-  if (flags != 3) { fprintf(stderr, "oracle must be built with -H -T\n"); return 1; }
-  size_t cmp = nr < rn ? nr : rn, bad = 0, toks = 0, hits = 0;
-  for (size_t i = 0; i < cmp; i++) {
-    uint32_t c; if (fread(&c,4,1,rf)!=1) break;
-    bool ok = (c == hc[i]);
-    for (uint32_t j = 0; j < c; j++) {
-      uint32_t tax; if (fread(&tax,4,1,rf)!=1) { ok=false; break; }
-      toks++; if (tax) hits++;
-      if (ok && ht[ooff[i]+j] != tax) ok = false;
+  FILE *rf = fopen(argv[5], "rb");
+  if (! rf) { fprintf(stderr, "cannot open %s\n", argv[5]); return 1; }
+  size_t bad = 0, seen = 0, classified = 0;
+  char oline[8192];
+  for (size_t i = 0; i < nr && fgets(oline, sizeof oline, rf); i++) {
+    unsigned long want = 0;
+    char *p1 = strchr(oline, '\t');
+    char *p2 = p1 ? strchr(p1 + 1, '\t') : nullptr;
+    if (p2) want = strtoul(p2 + 1, nullptr, 10);
+    seen++;
+    if (want) classified++;
+    if ((unsigned long) hcall[i] != want) {
+      if (bad < 3)
+        fprintf(stderr, "read %zu: classify %lu, gpu %u\n", i, want, hcall[i]);
+      bad++;
     }
-    if (!ok) { if (bad<3) fprintf(stderr,"read %zu differs (cpu %u, gpu %u tokens)\n",i,c,hc[i]); bad++; }
   }
   fclose(rf);
-  printf("verified %zu reads, %zu tokens (%.1f%% with a taxon): %zu mismatched\n",
-         cmp, toks, toks?100.0*hits/toks:0, bad);
+  printf("verified %zu calls against classify (%.2f%% classified): %zu mismatched\n",
+         seen, seen ? 100.0 * classified / seen : 0.0, bad);
   return bad ? 2 : 0;
 }
