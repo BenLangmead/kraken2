@@ -229,7 +229,7 @@ __global__ void fused(const char *__restrict__ bases,
     // reduction across the block.
     if (threadIdx.x == 0) {
       int n = n_kmer ? scan[n_kmer - 1] : 0;
-      out_count[r] = (uint32_t) n;
+      if (out_count) out_count[r] = (uint32_t) n;
       uint32_t tx[64], ct[64]; int nd = 0;
       for (int j = 0; j < n; j++) {
         uint32_t t = stax[j];
@@ -288,13 +288,22 @@ __global__ void parse_blocks(const char *__restrict__ buf,
     for (uint32_t i = s0; i < s1; i++) if (p[i] == '\n') nl[w++] = i;
     __syncthreads();
 
-    // Record r: header is line 4r, bases are line 4r+1.
+    // A record is four lines, so a well formed block holds exactly 4*recs
+    // newlines.  Anything else means the bytes are not what the index claims --
+    // most likely decompression did not produce them -- and reading on would
+    // hand the classifier wild offsets.  Emit empty reads instead, which it
+    // already ignores, so the failure shows up as a mismatch rather than a
+    // fault with no explanation.
+    int total_nl = nl_scan[blockDim.x - 1] + nl_count[blockDim.x - 1];
+    bool sane = (total_nl == (int) (4 * recs));
+
     for (uint32_t r = threadIdx.x; r < recs; r += blockDim.x) {
+      uint64_t idx = blk_rec[b] - base_rec + r;
+      if (!sane) { out_off[idx] = 0; out_len[idx] = 0; continue; }
       uint32_t seq_beg = nl[4 * r] + 1;
       uint32_t seq_end = nl[4 * r + 1];
-      uint64_t idx = blk_rec[b] - base_rec + r;
       out_off[idx] = (uint32_t) (lo + seq_beg);
-      out_len[idx] = seq_end - seq_beg;
+      out_len[idx] = seq_end > seq_beg ? seq_end - seq_beg : 0;
     }
     __syncthreads();
   }

@@ -47,6 +47,10 @@ int main(int argc, char **argv) {
     return 1;
   }
   size_t chunk_blocks = argc > 7 ? (size_t) atoll(argv[7]) : 4096;
+  // Stopping after a few chunks keeps a run under compute-sanitizer short
+  // enough to be usable.
+  size_t max_chunks = argc > 8 ? (size_t) atoll(argv[8]) : (size_t) -1;
+  size_t chunks_done = 0;
 
   // ---- index ----
   IdxHeader ih;
@@ -210,6 +214,25 @@ int main(int argc, char **argv) {
     NK(nvcompBatchedGzipDecompressAsync((const void *const *) d_cptr, d_cb, d_ub,
         d_ac, nb, d_temp, temp_bytes, (void *const *) d_uptr, nopts, d_st, stream));
 
+    // Decompression reports per block, and ignoring that turns a decode failure
+    // into a wild read three kernels later.  Checked on the first chunk, which
+    // is where a wrong argument would show up.
+    if (b0 == 0) {
+      CK(cudaStreamSynchronize(stream));
+      std::vector<nvcompStatus_t> st(nb);
+      std::vector<size_t> ac(nb);
+      CK(cudaMemcpy(st.data(), d_st, nb*sizeof(nvcompStatus_t), cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(ac.data(), d_ac, nb*8, cudaMemcpyDeviceToHost));
+      size_t nbad = 0, nshort = 0;
+      for (size_t i = 0; i < nb; i++) {
+        if (st[i] != nvcompSuccess) nbad++;
+        if (ac[i] != h_ub[i]) nshort++;
+      }
+      printf("decompress: %zu blocks, %zu failed, %zu wrong size "
+             "(first block %zu of %zu bytes)\n", nb, nbad, nshort, ac[0], h_ub[0]);
+      if (nbad || nshort) { fprintf(stderr, "decompression did not agree with the index\n"); return 2; }
+    }
+
     parse_blocks<<<(unsigned) std::min(nb, (size_t) 8192), 256, shmem, stream>>>(
         d_ubuf, d_buoff, d_brec, ent[b0].uoff, (uint32_t) nb, ent[b0].rec, d_off, d_len);
 
@@ -222,6 +245,7 @@ int main(int argc, char **argv) {
                        cudaMemcpyDeviceToHost, stream));
     CK(cudaStreamSynchronize(stream));
     done_reads += nrec;
+    if (++chunks_done >= max_chunks) break;
   }
   double el = now_s() - t0;
 
