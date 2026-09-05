@@ -79,11 +79,14 @@ int main(int argc, char **argv) {
          k, l, cap, key_bits, value_bits);
 
   FILE *f = fopen(argv[1], "rb");
+  if (! f) { fprintf(stderr, "cannot open reads %s\n", argv[1]); return 1; }
   FILE *rf = fopen(argv[4], "rb");
+  if (! rf) { fprintf(stderr, "cannot open oracle %s\n", argv[4]); return 1; }
   char magic[8]; size_t z = fread(magic,1,8,rf); (void) z;
   char flags; z = fread(&flags,1,1,rf);
   uint64_t rn; z = fread(&rn,8,1,rf);
-  if (flags != 2) { fprintf(stderr, "oracle not built with -H\n"); return 1; }
+  if (flags != 2 && flags != 3) { fprintf(stderr, "oracle needs -H (flags 2) or -H -T (flags 3)\n"); return 1; }
+  bool taxa_mode = (flags == 3);
 
   char line[8192];
   size_t nr = 0, bad = 0, pairs = 0;
@@ -166,6 +169,38 @@ int main(int argc, char **argv) {
       for (int p = 0; p < n_kmer; p++) scan[p] = tmp[p];
     }
     int count = n_kmer ? scan[n_kmer-1] : 0;
+
+    if (taxa_mode) {
+      // One entry per reported minimizer.  A repeat inherits the taxon set at
+      // the start of its equal-value run, and a run whose start was dropped by
+      // the subsampling filter contributes zero, which is exactly what
+      // last_taxon does sequentially on the CPU.
+      std::vector<uint32_t> gt;
+      for (int p = 0; p < n_kmer; p++) {
+        if (!flag[p]) continue;
+        int start = p, q = p - 1;
+        while (true) {
+          while (q >= 0 && !flag[q]) q--;
+          if (q < 0 || val[q] != val[p]) break;
+          start = q; q--;
+        }
+        bool filtered = mahv && murmur(val[start]) < mahv;
+        gt.push_back(filtered ? 0u
+                              : probe(table, cap, val[p], (int) key_bits, (int) value_bits));
+      }
+      uint32_t c; if (fread(&c,4,1,rf)!=1) break;
+      bool ok = (c == gt.size());
+      for (uint32_t j = 0; j < c; j++) {
+        uint32_t tax; if (fread(&tax,4,1,rf)!=1) { ok=false; break; }
+        pairs++;
+        if (ok && gt[j] != tax) ok = false;
+      }
+      if (!ok) { if (bad<5) fprintf(stderr,"read %zu taxa differ (cpu %u, emul %zu)\n", nr, c, gt.size()); bad++; }
+      if (!fgets(line, sizeof line, f)) break;
+      if (!fgets(line, sizeof line, f)) break;
+      nr++;
+      continue;
+    }
 
     std::vector<uint64_t> gk(count); std::vector<uint32_t> gt(count);
     for (int p = 0; p < n_kmer; p++) {

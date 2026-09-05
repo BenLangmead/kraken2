@@ -168,7 +168,7 @@ __global__ void fused(const char *__restrict__ bases,
     // Stable compaction: output order has to match the CPU's, so an atomic
     // counter will not do.  Hillis-Steele over the flags gives each surviving
     // position its index.
-    for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) scan[p] = look[p];
+    for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) scan[p] = flag[p];
     __syncthreads();
     // Double buffered: reading and writing one array in place would race
     // between threads within a step.
@@ -181,13 +181,25 @@ __global__ void fused(const char *__restrict__ bases,
       __syncthreads();
     }
 
+    // One entry per reported minimizer.  A repeat inherits the taxon set at the
+    // start of its equal-value run, and a run whose start the subsampling
+    // filter dropped contributes zero, which is what last_taxon does
+    // sequentially on the CPU.  Expressed this way it needs no scan: the run
+    // start is a short walk back.
     uint32_t obase = out_offsets[r];
     for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
-      if (!look[p]) continue;
+      if (!flag[p]) continue;
+      int start = p, q = p - 1;
+      while (true) {
+        while (q >= 0 && !flag[q]) q--;
+        if (q < 0 || val[q] != val[p]) break;
+        start = q; q--;
+      }
+      bool filtered = min_acceptable && murmur(val[start]) < min_acceptable;
       int slot = scan[p] - 1;
-      uint64_t key = val[p];
-      out_key[obase + slot] = key;
-      out_tax[obase + slot] = probe(table, capacity, key, key_bits, value_bits);
+      out_key[obase + slot] = val[p];
+      out_tax[obase + slot] = filtered
+          ? 0u : probe(table, capacity, val[p], key_bits, value_bits);
     }
     if (threadIdx.x == 0)
       out_count[r] = n_kmer ? (uint32_t) scan[n_kmer - 1] : 0;
@@ -244,6 +256,7 @@ int main(int argc, char **argv) {
 
   // ---- reads ----
   FILE *f = fopen(argv[1], "rb");
+  if (! f) { fprintf(stderr, "cannot open reads %s\n", argv[1]); return 1; }
   std::vector<char> bases; std::vector<uint32_t> offs, lens;
   char line[8192]; size_t nr = 0;
   while (nr < limit && fgets(line, sizeof line, f)) {
@@ -299,24 +312,24 @@ int main(int argc, char **argv) {
   CK(cudaMemcpy(hc.data(), d_cnt, nr*4, cudaMemcpyDeviceToHost));
 
   FILE *rf = fopen(argv[4], "rb");
+  if (! rf) { fprintf(stderr, "cannot open oracle %s\n", argv[4]); return 1; }
   char magic[8]; size_t z = fread(magic,1,8,rf); (void)z;
   char flags; z = fread(&flags,1,1,rf);
   uint64_t rn; z = fread(&rn,8,1,rf);
-  if (flags != 2) { fprintf(stderr, "oracle was not built with -H\n"); return 1; }
-  size_t cmp = nr < rn ? nr : rn, bad = 0, pairs = 0, hits = 0;
+  if (flags != 3) { fprintf(stderr, "oracle must be built with -H -T\n"); return 1; }
+  size_t cmp = nr < rn ? nr : rn, bad = 0, toks = 0, hits = 0;
   for (size_t i = 0; i < cmp; i++) {
     uint32_t c; if (fread(&c,4,1,rf)!=1) break;
     bool ok = (c == hc[i]);
     for (uint32_t j = 0; j < c; j++) {
-      uint64_t key; uint32_t tax;
-      if (fread(&key,8,1,rf)!=1 || fread(&tax,4,1,rf)!=1) { ok=false; break; }
-      pairs++; if (tax) hits++;
-      if (ok && (hk[ooff[i]+j] != key || ht[ooff[i]+j] != tax)) ok = false;
+      uint32_t tax; if (fread(&tax,4,1,rf)!=1) { ok=false; break; }
+      toks++; if (tax) hits++;
+      if (ok && ht[ooff[i]+j] != tax) ok = false;
     }
-    if (!ok) { if (bad<3) fprintf(stderr,"read %zu differs (cpu %u, gpu %u pairs)\n",i,c,hc[i]); bad++; }
+    if (!ok) { if (bad<3) fprintf(stderr,"read %zu differs (cpu %u, gpu %u tokens)\n",i,c,hc[i]); bad++; }
   }
   fclose(rf);
-  printf("verified %zu reads, %zu lookups (%.1f%% hit): %zu mismatched\n",
-         cmp, pairs, pairs?100.0*hits/pairs:0, bad);
+  printf("verified %zu reads, %zu tokens (%.1f%% with a taxon): %zu mismatched\n",
+         cmp, toks, toks?100.0*hits/toks:0, bad);
   return bad ? 2 : 0;
 }

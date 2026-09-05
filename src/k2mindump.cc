@@ -27,20 +27,24 @@
 
 using namespace kraken2;
 
+// TAXID_MAX - 2, narrowed to the 32-bit field this dump uses.
+static const uint32_t AMBIGUOUS_SPAN_TAXON_32 = 0xFFFFFFFDu;
+
 static const char DUMP_MAGIC[8] = {'K','2','M','D','U','M','P','\1'};
 
 int main(int argc, char **argv) {
   const char *opts_file = nullptr, *out_file = nullptr, *hash_file = nullptr;
-  bool per_position = false;
+  bool per_position = false, want_taxa = false;
   size_t limit = SIZE_MAX;
   int c;
-  while ((c = getopt(argc, argv, "o:d:n:pH:")) != -1) {
+  while ((c = getopt(argc, argv, "o:d:n:pH:T")) != -1) {
     switch (c) {
       case 'o': opts_file = optarg; break;
       case 'd': out_file = optarg; break;
       case 'n': limit = (size_t) atoll(optarg); break;
       case 'p': per_position = true; break;
       case 'H': hash_file = optarg; break;
+      case 'T': want_taxa = true; break;
       default:
         std::cerr << "usage: k2mindump -o opts.k2d -d out.k2mm [-n reads] [-p] in.fq"
                   << std::endl;
@@ -49,6 +53,8 @@ int main(int argc, char **argv) {
   }
   if (! opts_file || ! out_file || optind >= argc)
     errx(EX_USAGE, "-o, -d and an input file are all required");
+  if (want_taxa && ! hash_file)
+    errx(EX_USAGE, "-T needs -H, since the taxa come from the table");
 
   IndexOptions idx;
   memset(&idx, 0, sizeof idx);
@@ -75,7 +81,7 @@ int main(int argc, char **argv) {
   }
 
   uint64_t n_reads = 0, n_min = 0, n_looked_up = 0;
-  char flags = hash_file ? 2 : (per_position ? 1 : 0);
+  char flags = want_taxa ? 3 : (hash_file ? 2 : (per_position ? 1 : 0));
   fwrite(DUMP_MAGIC, 1, 8, out);
   fwrite(&flags, 1, 1, out);
   long count_pos = ftell(out);
@@ -91,6 +97,46 @@ int main(int argc, char **argv) {
     reader.Parse();
     for (size_t i = 0; i < reader.size() && n_reads < limit; i++) {
       const SeqView &s = reader[i];
+
+      if (want_taxa) {
+        // Mirrors ScanFragmentTokens and the replay that follows it: one entry
+        // per reported minimizer, a repeat inheriting the running taxon, and a
+        // skipped minimizer resetting it to zero.
+        std::vector<uint32_t> taxa;
+        scanner.LoadSequence(s.seq, s.seq_len);
+        uint64_t last_minimizer = UINT64_MAX;
+        uint32_t last_taxon = 0;
+        uint64_t *mp;
+        while ((mp = scanner.NextMinimizer()) != nullptr) {
+          if (scanner.is_ambiguous()) {
+            taxa.push_back(AMBIGUOUS_SPAN_TAXON_32);
+            continue;
+          }
+          uint32_t taxon;
+          if (*mp != last_minimizer) {
+            last_minimizer = *mp;
+            if (idx.minimum_acceptable_hash_value &&
+                MurmurHash3(*mp) < idx.minimum_acceptable_hash_value) {
+              taxon = 0; last_taxon = 0;
+            } else {
+              taxon = (uint32_t) hash->Get(*mp);
+              last_taxon = taxon;
+            }
+          } else {
+            taxon = last_taxon;
+          }
+          taxa.push_back(taxon);
+        }
+        uint32_t cnt = (uint32_t) taxa.size();
+        fwrite(&cnt, sizeof cnt, 1, out);
+        if (cnt) fwrite(&taxa[0], sizeof(uint32_t), cnt, out);
+        for (uint32_t j = 0; j < cnt; j++)
+          if (taxa[j] && taxa[j] != AMBIGUOUS_SPAN_TAXON_32) n_looked_up++;
+        n_min += cnt;
+        n_reads++;
+        continue;
+      }
+
       mins.clear();
       scanner.LoadSequence(s.seq, s.seq_len);
       uint64_t *m;
