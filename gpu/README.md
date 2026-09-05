@@ -10,6 +10,8 @@ agree with it, and each records a measurement taken on an L40S (`g6e`, us-east-1
 | `gpu_inflate.cc` | nvCOMP gzip decode of record-aligned BGZF blocks | byte-exact vs the original FASTQ; 34.3 GB/s |
 | `fused.cu` | scan, subsample and probe together, real 16 GB table | logic verified via `emul.cc`; not yet run on a device |
 | `emul.cc` | host emulation of `fused.cu`, minus the CUDA parts | exact on 50,000 reads / 262,335 lookups |
+| `kernels.cuh` | the device kernels, shared so the two programs cannot drift | &mdash; |
+| `k2gpu.cu` | end to end: BGZF in, one call per read out | first end-to-end run |
 
 `emul.cc` exists because device time is the scarce resource.  Running the
 kernel's logic on the host first caught two defects that would otherwise have
