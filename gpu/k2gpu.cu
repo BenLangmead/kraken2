@@ -22,6 +22,11 @@
 #include <cuda_runtime_api.h>
 #include <nvcomp/gzip.h>
 #include "kernels.cuh"
+#include <map>
+#include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include "../src/mmscanner.h"
 
 #define CK(x) do { cudaError_t e=(x); if (e!=cudaSuccess) { \
   fprintf(stderr,"cuda %s at %d\n",cudaGetErrorString(e),__LINE__); exit(1);} } while(0)
@@ -33,6 +38,91 @@ struct IdxHeader {
   uint64_t n_blocks, n_records, total_uncompressed;
 };
 struct IdxEnt { uint64_t coff, uoff, rec; };
+
+// Kraken 2's own scanner, over the handful of reads carrying an ambiguous
+// base.  Using it rather than reproducing its refill behaviour is the point:
+// it emits the ambiguous spans exactly, including the token-per-character it
+// produces while recovering, which is what the device version gets wrong.
+struct HostFallback {
+  const uint32_t *table; uint64_t capacity; int key_bits, value_bits;
+  const uint64_t *parent, *extid; uint64_t mahv;
+  kraken2::MinimizerScanner *scanner;
+
+  uint32_t probe_host(uint64_t key) const {
+    uint64_t hc = murmur(key);
+    uint32_t compacted = (uint32_t) (hc >> (64 - key_bits));
+    uint64_t idx = hc % capacity, first = idx;
+    const uint32_t vmask = (1u << value_bits) - 1;
+    while (true) {
+      uint32_t cell = table[idx];
+      uint32_t v = cell & vmask;
+      if (!v) return 0;
+      if ((cell >> value_bits) == compacted) return v;
+      if (++idx == capacity) idx = 0;
+      if (idx == first) return 0;
+    }
+  }
+  bool is_anc(uint64_t a, uint64_t b) const {
+    if (!a || !b) return false;
+    while (b > a) b = parent[b];
+    return b == a;
+  }
+  uint64_t lca_h(uint64_t a, uint64_t b) const {
+    if (!a || !b) return a ? a : b;
+    while (a != b) { if (a > b) a = parent[a]; else b = parent[b]; }
+    return a;
+  }
+
+  std::string line(const char *hdr, uint32_t hlen, const char *seq, uint32_t slen) {
+    static const uint32_t AMBIG = 0xFFFFFFFDu;   // TAXID_MAX - 2, narrowed
+    std::vector<uint32_t> taxa;
+    std::map<uint32_t, uint64_t> hits;
+    scanner->LoadSequence(seq, slen);
+    uint64_t last_min = UINT64_MAX; uint32_t last_taxon = 0, *mpv;
+    uint64_t *mp;
+    (void) mpv;
+    while ((mp = scanner->NextMinimizer()) != nullptr) {
+      if (scanner->is_ambiguous()) { taxa.push_back(AMBIG); continue; }
+      uint32_t taxon;
+      if (*mp != last_min) {
+        last_min = *mp;
+        if (mahv && murmur(*mp) < mahv) { taxon = 0; last_taxon = 0; }
+        else { taxon = probe_host(*mp); last_taxon = taxon; }
+      } else taxon = last_taxon;
+      if (taxon) hits[taxon]++;
+      taxa.push_back(taxon);
+    }
+    uint64_t max_taxon = 0; uint32_t max_score = 0;
+    for (auto &a : hits) {
+      uint32_t sc = 0;
+      for (auto &b : hits) if (is_anc(b.first, a.first)) sc += (uint32_t) b.second;
+      if (sc > max_score) { max_score = sc; max_taxon = a.first; }
+      else if (sc == max_score) max_taxon = lca_h(max_taxon, a.first);
+    }
+    uint64_t ext = max_taxon ? extid[max_taxon] : 0;
+
+    char buf[8192]; int n = 0;
+    n += snprintf(buf+n, sizeof buf-n, "%c\t", max_taxon ? 'C' : 'U');
+    n += snprintf(buf+n, sizeof buf-n, "%.*s\t%llu\t%u\t",
+                  (int) hlen, hdr, (unsigned long long) ext, slen);
+    if (taxa.empty()) n += snprintf(buf+n, sizeof buf-n, "0:0");
+    else {
+      uint32_t last = taxa[0]; int run = 1;
+      for (size_t i = 1; i < taxa.size(); i++) {
+        if (taxa[i] == last) { run++; continue; }
+        if (last == AMBIG) n += snprintf(buf+n, sizeof buf-n, "A:%d ", run);
+        else n += snprintf(buf+n, sizeof buf-n, "%llu:%d ",
+                           (unsigned long long) (last ? extid[last] : 0), run);
+        last = taxa[i]; run = 1;
+      }
+      if (last == AMBIG) n += snprintf(buf+n, sizeof buf-n, "A:%d", run);
+      else n += snprintf(buf+n, sizeof buf-n, "%llu:%d",
+                         (unsigned long long) (last ? extid[last] : 0), run);
+    }
+    n += snprintf(buf+n, sizeof buf-n, "\n");
+    return std::string(buf, n);
+  }
+};
 
 static double now_s() {
   struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -109,8 +199,21 @@ int main(int argc, char **argv) {
     printf("table: %.2f GB resident\n", done / 1e9);
   }
 
+  // A host view of the same table for the fallback path.  Mapping it costs
+  // nothing until a page is touched, and only a handful ever are.
+  const uint32_t *h_table = nullptr;
+  {
+    int hf = open(argv[3], O_RDONLY);
+    struct stat st; fstat(hf, &st);
+    char *m = (char *) mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, hf, 0);
+    if (m == MAP_FAILED) { perror("mmap hash"); return 1; }
+    h_table = (const uint32_t *) (m + 32);
+    close(hf);
+  }
+
   // ---- taxonomy: parent and external id only ----
   uint64_t *d_parent, *d_extid, node_count;
+  std::vector<uint64_t> h_par, h_ext;
   {
     int tf = open(argv[5], O_RDONLY);
     char hdr[32];
@@ -126,7 +229,8 @@ int main(int argc, char **argv) {
       got += n;
     }
     close(tf);
-    std::vector<uint64_t> par(node_count), ext(node_count);
+    h_par.resize(node_count); h_ext.resize(node_count);
+    std::vector<uint64_t> &par = h_par, &ext = h_ext;
     for (uint64_t i = 0; i < node_count; i++) { par[i] = raw[i*7]; ext[i] = raw[i*7+5]; }
     CK(cudaMalloc(&d_parent, node_count*8)); CK(cudaMalloc(&d_extid, node_count*8));
     CK(cudaMemcpy(d_parent, par.data(), node_count*8, cudaMemcpyHostToDevice));
@@ -157,6 +261,7 @@ int main(int argc, char **argv) {
   CK(cudaMalloc(&d_hoff, max_r*4)); CK(cudaMalloc(&d_hlen, max_r*4));
   CK(cudaMalloc(&d_llen, max_r*4)); CK(cudaMalloc(&d_loff, max_r*4));
   uint32_t *d_over = nullptr;
+  uint8_t *d_amb = nullptr;
   uint32_t scan_blocks = (uint32_t) ((max_r + 255) / 256);
   CK(cudaMalloc(&d_sums, (scan_blocks + 1) * 4));
 
@@ -170,6 +275,7 @@ int main(int argc, char **argv) {
     CK(cudaMalloc(&d_packed, (size_t) max_r * TEXT_STRIDE / 4));
     CK(cudaHostAlloc(&h_out, (size_t) max_r * TEXT_STRIDE / 4, cudaHostAllocDefault));
     CK(cudaMalloc(&d_over, 4)); CK(cudaMemset(d_over, 0, 4));
+    CK(cudaMalloc(&d_amb, max_r));
   }
   uint64_t *d_buoff, *d_brec;
   CK(cudaMalloc(&d_buoff, (chunk_blocks+1)*8));
@@ -196,7 +302,10 @@ int main(int argc, char **argv) {
          "parse shared %.1f KB\n", chunk_blocks, max_c/1e6, max_u/1e6, max_r, shmem/1024.0);
 
   int out_fd = -1;
-  size_t out_bytes = 0;
+  size_t out_bytes = 0, n_fallback = 0;
+  kraken2::MinimizerScanner fb_scanner(k, l, ssm, true, tog, (int) o[6]);
+  HostFallback fb_ctx{h_table, capacity, (int) key_bits, (int) value_bits,
+                      h_par.data(), h_ext.data(), mahv, &fb_scanner};
   if (out_path) {
     out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) { fprintf(stderr, "cannot write %s\n", out_path); return 1; }
@@ -268,9 +377,10 @@ int main(int argc, char **argv) {
         d_ubuf, d_off, d_len, (uint32_t) nrec, k, l, ssm, tog, mahv,
         d_table, capacity, (int) key_bits, (int) value_bits,
         nullptr, nullptr, nullptr, nullptr, d_parent, d_extid, d_call,
-        d_hoff, d_hlen, d_text, TEXT_STRIDE, d_llen, d_over);
+        d_hoff, d_hlen, d_text, TEXT_STRIDE, d_llen, d_over, d_amb);
 
     if (out_path) {
+      CK(cudaMemsetAsync(d_amb, 0, nrec, stream));
       uint32_t nblk = (uint32_t) ((nrec + 255) / 256);
       scan_pass1<<<nblk, 256, 0, stream>>>(d_llen, d_loff, d_sums, (uint32_t) nrec);
       scan_pass2<<<1, 1, 0, stream>>>(d_sums, nblk);
@@ -289,13 +399,45 @@ int main(int argc, char **argv) {
       }
       CK(cudaMemcpyAsync(h_out, d_packed, tbytes, cudaMemcpyDeviceToHost, stream));
       CK(cudaStreamSynchronize(stream));
-      size_t w = 0;
-      while (w < tbytes) {
-        ssize_t n = write(out_fd, h_out + w, tbytes - w);
-        if (n <= 0) { perror("write"); return 1; }
-        w += n;
+      // Reads the kernel declined contribute no bytes, so their line belongs
+      // exactly at their offset.  Splice the host's version in there.
+      std::vector<uint8_t> amb(nrec);
+      CK(cudaMemcpy(amb.data(), d_amb, nrec, cudaMemcpyDeviceToHost));
+      std::vector<uint32_t> fb;
+      for (size_t i = 0; i < nrec; i++) if (amb[i]) fb.push_back((uint32_t) i);
+
+      auto emit = [&](const char *p, size_t nb) {
+        size_t w = 0;
+        while (w < nb) {
+          ssize_t got = write(out_fd, p + w, nb - w);
+          if (got <= 0) { perror("write"); exit(1); }
+          w += got;
+        }
+        out_bytes += nb;
+      };
+
+      if (fb.empty()) emit(h_out, tbytes);
+      else {
+        std::vector<uint32_t> loff(nrec), soff(nrec), slen(nrec), hoff(nrec), hlen(nrec);
+        CK(cudaMemcpy(loff.data(), d_loff, nrec*4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(soff.data(), d_off,  nrec*4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(slen.data(), d_len,  nrec*4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hoff.data(), d_hoff, nrec*4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hlen.data(), d_hlen, nrec*4, cudaMemcpyDeviceToHost));
+        size_t pos = 0;
+        std::vector<char> rb;
+        for (uint32_t r : fb) {
+          emit(h_out + pos, loff[r] - pos);
+          pos = loff[r];
+          rb.resize(hlen[r] + slen[r]);
+          CK(cudaMemcpy(rb.data(), d_ubuf + hoff[r], hlen[r], cudaMemcpyDeviceToHost));
+          CK(cudaMemcpy(rb.data() + hlen[r], d_ubuf + soff[r], slen[r], cudaMemcpyDeviceToHost));
+          std::string ln = fb_ctx.line(rb.data(), hlen[r], rb.data() + hlen[r], slen[r]);
+          emit(ln.data(), ln.size());
+          n_fallback++;
+        }
+        emit(h_out + pos, tbytes - pos);
       }
-      out_bytes += tbytes;
     }
 
     CK(cudaMemcpyAsync(h_call.data() + done_reads, d_call, nrec*4,
@@ -314,8 +456,8 @@ int main(int argc, char **argv) {
   if (out_bytes) {
     uint32_t over = 0;
     CK(cudaMemcpy(&over, d_over, 4, cudaMemcpyDeviceToHost));
-    printf("             wrote %.2f GB of output, %u lines truncated\n",
-           out_bytes / 1e9, over);
+    printf("             wrote %.2f GB of output, %u truncated, "
+           "%zu reads via the host fallback\n", out_bytes / 1e9, over, n_fallback);
     if (over) { fprintf(stderr, "some hit lists did not fit the slot\n"); return 1; }
   }
 

@@ -103,7 +103,8 @@ __global__ void fused(const char *__restrict__ bases,
                       const uint32_t *__restrict__ hdr_len,
                       char *__restrict__ out_text, uint32_t text_stride,
                       uint32_t *__restrict__ out_linelen,
-                      uint32_t *__restrict__ out_overflow) {
+                      uint32_t *__restrict__ out_overflow,
+                      uint8_t *__restrict__ out_amb) {
   __shared__ uint64_t cand[MAX_LEN];
   __shared__ uint8_t  code[MAX_LEN];
   __shared__ uint64_t val[MAX_LEN];
@@ -112,12 +113,15 @@ __global__ void fused(const char *__restrict__ bases,
   __shared__ int      scan[MAX_LEN];
   __shared__ int      tmp[MAX_LEN];
   __shared__ uint32_t stax[MAX_LEN];
+  __shared__ int amb_read;
 
   for (uint32_t r = blockIdx.x; r < n_reads; r += gridDim.x) {
     const char *seq = bases + offsets[r];
     int len = (int) lengths[r];
     if (len > MAX_LEN) len = MAX_LEN;
 
+    if (threadIdx.x == 0) amb_read = 0;
+    __syncthreads();
     for (int i = threadIdx.x; i < len; i += blockDim.x) {
       char c = seq[i]; uint8_t v;
       switch (c) {
@@ -128,6 +132,7 @@ __global__ void fused(const char *__restrict__ bases,
         default:  v = 4; break;
       }
       code[i] = v;
+      if (v == 4) amb_read = 1;
     }
     __syncthreads();
 
@@ -255,9 +260,17 @@ __global__ void fused(const char *__restrict__ bases,
       uint64_t ext_call = call ? extid[call] : 0;
       out_call[r] = (uint32_t) ext_call;
 
-      // The output line, in Kraken 2's format: a verdict, the read's
-      // identifier, the call, the read length, and the run-length hit list.
-      if (out_text) {
+      // A read carrying an ambiguous base is handed back to the host.  Kraken 2
+      // emits a token per character while its scanner refills after one, which
+      // this kernel does not reproduce, and getting it wrong changes the
+      // confidence denominator.  Rather than model that here for the roughly one
+      // read in a million that needs it, the line is left empty and the host
+      // reclassifies with the original scanner.
+      if (amb_read) {
+        if (out_linelen) out_linelen[r] = 0;
+        if (out_amb) out_amb[r] = 1;
+      }
+      else if (out_text) {
         // A hit list has one run per reported minimizer, so a long read with
         // no repeats can produce a long line.  Rather than size the slot for
         // the worst case everywhere, stop short of the end and report it, so a
