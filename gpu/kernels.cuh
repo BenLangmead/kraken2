@@ -76,6 +76,14 @@ __device__ uint32_t resolve(const uint64_t *__restrict__ parent,
   return (uint32_t) max_taxon;
 }
 
+__device__ __forceinline__ int put_u64(char *p, uint64_t v) {
+  if (v == 0) { p[0] = '0'; return 1; }
+  char t[24]; int n = 0;
+  while (v) { t[n++] = (char) ('0' + (v % 10)); v /= 10; }
+  for (int i = 0; i < n; i++) p[i] = t[n - 1 - i];
+  return n;
+}
+
 __global__ void fused(const char *__restrict__ bases,
                       const uint32_t *__restrict__ offsets,
                       const uint32_t *__restrict__ lengths,
@@ -90,7 +98,12 @@ __global__ void fused(const char *__restrict__ bases,
                       const uint32_t *__restrict__ out_offsets,
                       const uint64_t *__restrict__ parent,
                       const uint64_t *__restrict__ extid,
-                      uint32_t *__restrict__ out_call) {
+                      uint32_t *__restrict__ out_call,
+                      const uint32_t *__restrict__ hdr_off,
+                      const uint32_t *__restrict__ hdr_len,
+                      char *__restrict__ out_text, uint32_t text_stride,
+                      uint32_t *__restrict__ out_linelen,
+                      uint32_t *__restrict__ out_overflow) {
   __shared__ uint64_t cand[MAX_LEN];
   __shared__ uint8_t  code[MAX_LEN];
   __shared__ uint64_t val[MAX_LEN];
@@ -239,7 +252,44 @@ __global__ void fused(const char *__restrict__ bases,
         else ct[q]++;
       }
       uint32_t call = resolve(parent, tx, ct, nd);
-      out_call[r] = call ? (uint32_t) extid[call] : 0u;
+      uint64_t ext_call = call ? extid[call] : 0;
+      out_call[r] = (uint32_t) ext_call;
+
+      // The output line, in Kraken 2's format: a verdict, the read's
+      // identifier, the call, the read length, and the run-length hit list.
+      if (out_text) {
+        // A hit list has one run per reported minimizer, so a long read with
+        // no repeats can produce a long line.  Rather than size the slot for
+        // the worst case everywhere, stop short of the end and report it, so a
+        // too-narrow slot shows up as a counted failure instead of a
+        // neighbouring line quietly overwritten.
+        char *w = out_text + (size_t) r * text_stride;
+        char *w0 = w;
+        char *wend = w0 + text_stride - 24;
+        *w++ = call ? 'C' : 'U'; *w++ = '\t';
+        const char *h = bases + hdr_off[r];
+        for (uint32_t i = 0; i < hdr_len[r]; i++) *w++ = h[i];
+        *w++ = '\t';
+        w += put_u64(w, ext_call); *w++ = '\t';
+        w += put_u64(w, (uint64_t) len); *w++ = '\t';
+        if (n == 0) { *w++='0'; *w++=':'; *w++='0'; }
+        else {
+          uint32_t last = stax[0]; int run = 1;
+          bool over = false;
+          for (int j = 1; j < n; j++) {
+            if (stax[j] == last) { run++; continue; }
+            if (w >= wend) { over = true; break; }
+            w += put_u64(w, last ? extid[last] : 0);
+            *w++ = ':'; w += put_u64(w, (uint64_t) run); *w++ = ' ';
+            last = stax[j]; run = 1;
+          }
+          if (over) atomicAdd(out_overflow, 1u);
+          w += put_u64(w, last ? extid[last] : 0);
+          *w++ = ':'; w += put_u64(w, (uint64_t) run);
+        }
+        *w++ = '\n';
+        out_linelen[r] = (uint32_t) (w - w0);
+      }
     }
     __syncthreads();
   }
@@ -257,7 +307,9 @@ __global__ void parse_blocks(const char *__restrict__ buf,
                              uint64_t base_uoff, uint32_t n_blocks,
                              uint64_t base_rec,
                              uint32_t *__restrict__ out_off,
-                             uint32_t *__restrict__ out_len) {
+                             uint32_t *__restrict__ out_len,
+                             uint32_t *__restrict__ out_hoff,
+                             uint32_t *__restrict__ out_hlen) {
   __shared__ int nl_count[256];
   __shared__ int nl_scan[256];
   extern __shared__ uint32_t nl[];
@@ -299,13 +351,74 @@ __global__ void parse_blocks(const char *__restrict__ buf,
 
     for (uint32_t r = threadIdx.x; r < recs; r += blockDim.x) {
       uint64_t idx = blk_rec[b] - base_rec + r;
-      if (!sane) { out_off[idx] = 0; out_len[idx] = 0; continue; }
+      if (!sane) {
+        out_off[idx] = 0; out_len[idx] = 0;
+        if (out_hoff) { out_hoff[idx] = 0; out_hlen[idx] = 0; }
+        continue;
+      }
       uint32_t seq_beg = nl[4 * r] + 1;
       uint32_t seq_end = nl[4 * r + 1];
       out_off[idx] = (uint32_t) (lo + seq_beg);
       out_len[idx] = seq_end > seq_beg ? seq_end - seq_beg : 0;
+      if (out_hoff) {
+        // The identifier is the header line past its '@', up to whitespace.
+        uint32_t h_beg = (r == 0) ? 0 : nl[4 * r - 1] + 1;
+        uint32_t h_end = nl[4 * r];
+        if (h_beg < h_end && p[h_beg] == '@') h_beg++;
+        uint32_t e = h_beg;
+        while (e < h_end && p[e] != ' ' && p[e] != '\t') e++;
+        out_hoff[idx] = (uint32_t) (lo + h_beg);
+        out_hlen[idx] = e - h_beg;
+      }
     }
     __syncthreads();
+  }
+}
+
+// Exclusive prefix sum over per-read line lengths, in three passes.  Only a
+// few hundred thousand values, so a simple version is ample and avoids pulling
+// in a library for it.
+__global__ void scan_pass1(const uint32_t *__restrict__ in,
+                           uint32_t *__restrict__ out,
+                           uint32_t *__restrict__ sums, uint32_t n) {
+  __shared__ uint32_t a[256], b[256];
+  uint32_t i = blockIdx.x * 256 + threadIdx.x;
+  uint32_t v = i < n ? in[i] : 0u;
+  a[threadIdx.x] = v;
+  __syncthreads();
+  for (int off = 1; off < 256; off <<= 1) {
+    b[threadIdx.x] = threadIdx.x >= (uint32_t) off
+        ? a[threadIdx.x] + a[threadIdx.x - off] : a[threadIdx.x];
+    __syncthreads();
+    a[threadIdx.x] = b[threadIdx.x];
+    __syncthreads();
+  }
+  if (i < n) out[i] = a[threadIdx.x] - v;          // exclusive within the block
+  if (threadIdx.x == 255) sums[blockIdx.x] = a[255];
+}
+
+__global__ void scan_pass2(uint32_t *__restrict__ sums, uint32_t nblk) {
+  if (threadIdx.x || blockIdx.x) return;
+  uint32_t run = 0;
+  for (uint32_t i = 0; i < nblk; i++) { uint32_t v = sums[i]; sums[i] = run; run += v; }
+}
+
+__global__ void scan_pass3(uint32_t *__restrict__ out,
+                           const uint32_t *__restrict__ sums, uint32_t n) {
+  uint32_t i = blockIdx.x * 256 + threadIdx.x;
+  if (i < n) out[i] += sums[blockIdx.x];
+}
+
+// Gathers the formatted lines out of their fixed-width slots into one run of
+// bytes, so the copy back to the host carries text and nothing else.
+__global__ void compact_text(const char *__restrict__ src, uint32_t stride,
+                             const uint32_t *__restrict__ len,
+                             const uint32_t *__restrict__ off,
+                             char *__restrict__ dst, uint32_t n) {
+  for (uint32_t r = blockIdx.x; r < n; r += gridDim.x) {
+    const char *s = src + (size_t) r * stride;
+    char *d = dst + off[r];
+    for (uint32_t i = threadIdx.x; i < len[r]; i += blockDim.x) d[i] = s[i];
   }
 }
 

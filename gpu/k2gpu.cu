@@ -50,6 +50,8 @@ int main(int argc, char **argv) {
   // Stopping after a few chunks keeps a run under compute-sanitizer short
   // enough to be usable.
   size_t max_chunks = argc > 8 ? (size_t) atoll(argv[8]) : (size_t) -1;
+  // Writing the answer is part of the job, so it is timed with the rest.
+  const char *out_path = getenv("K2GPU_OUT");
   size_t chunks_done = 0;
 
   // ---- index ----
@@ -149,9 +151,26 @@ int main(int argc, char **argv) {
   char *h_pin;  CK(cudaHostAlloc(&h_pin, max_c, cudaHostAllocDefault));
   char *d_cbuf; CK(cudaMalloc(&d_cbuf, max_c));
   char *d_ubuf; CK(cudaMalloc(&d_ubuf, max_u));
-  uint32_t *d_off, *d_len, *d_call;
+  uint32_t *d_off, *d_len, *d_call, *d_hoff, *d_hlen, *d_llen, *d_loff, *d_sums;
   CK(cudaMalloc(&d_off, max_r*4)); CK(cudaMalloc(&d_len, max_r*4));
   CK(cudaMalloc(&d_call, max_r*4));
+  CK(cudaMalloc(&d_hoff, max_r*4)); CK(cudaMalloc(&d_hlen, max_r*4));
+  CK(cudaMalloc(&d_llen, max_r*4)); CK(cudaMalloc(&d_loff, max_r*4));
+  uint32_t *d_over = nullptr;
+  uint32_t scan_blocks = (uint32_t) ((max_r + 255) / 256);
+  CK(cudaMalloc(&d_sums, (scan_blocks + 1) * 4));
+
+  // Lines are formatted into fixed-width slots, then packed.  The width is the
+  // worst case: an identifier, the call, the length, and one hit-list run per
+  // reported minimizer.
+  const uint32_t TEXT_STRIDE = 2048;
+  char *d_text = nullptr, *d_packed = nullptr, *h_out = nullptr;
+  if (out_path) {
+    CK(cudaMalloc(&d_text, (size_t) max_r * TEXT_STRIDE));
+    CK(cudaMalloc(&d_packed, (size_t) max_r * TEXT_STRIDE / 4));
+    CK(cudaHostAlloc(&h_out, (size_t) max_r * TEXT_STRIDE / 4, cudaHostAllocDefault));
+    CK(cudaMalloc(&d_over, 4)); CK(cudaMemset(d_over, 0, 4));
+  }
   uint64_t *d_buoff, *d_brec;
   CK(cudaMalloc(&d_buoff, (chunk_blocks+1)*8));
   CK(cudaMalloc(&d_brec,  (chunk_blocks+1)*8));
@@ -175,6 +194,14 @@ int main(int argc, char **argv) {
   size_t shmem = (4 * max_rec_per_blk + 16) * sizeof(uint32_t);
   printf("chunk: %zu blocks, %.0f MB compressed, %.0f MB expanded, %zu reads; "
          "parse shared %.1f KB\n", chunk_blocks, max_c/1e6, max_u/1e6, max_r, shmem/1024.0);
+
+  int out_fd = -1;
+  size_t out_bytes = 0;
+  if (out_path) {
+    out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out_fd < 0) { fprintf(stderr, "cannot write %s\n", out_path); return 1; }
+    printf("writing output to %s\n", out_path);
+  }
 
   // ---- the pipeline ----
   CK(cudaDeviceSynchronize());
@@ -234,12 +261,42 @@ int main(int argc, char **argv) {
     }
 
     parse_blocks<<<(unsigned) std::min(nb, (size_t) 8192), 256, shmem, stream>>>(
-        d_ubuf, d_buoff, d_brec, ent[b0].uoff, (uint32_t) nb, ent[b0].rec, d_off, d_len);
+        d_ubuf, d_buoff, d_brec, ent[b0].uoff, (uint32_t) nb, ent[b0].rec,
+        d_off, d_len, d_hoff, d_hlen);
 
     fused<<<8192, THREADS, 0, stream>>>(
         d_ubuf, d_off, d_len, (uint32_t) nrec, k, l, ssm, tog, mahv,
         d_table, capacity, (int) key_bits, (int) value_bits,
-        nullptr, nullptr, nullptr, nullptr, d_parent, d_extid, d_call);
+        nullptr, nullptr, nullptr, nullptr, d_parent, d_extid, d_call,
+        d_hoff, d_hlen, d_text, TEXT_STRIDE, d_llen, d_over);
+
+    if (out_path) {
+      uint32_t nblk = (uint32_t) ((nrec + 255) / 256);
+      scan_pass1<<<nblk, 256, 0, stream>>>(d_llen, d_loff, d_sums, (uint32_t) nrec);
+      scan_pass2<<<1, 1, 0, stream>>>(d_sums, nblk);
+      scan_pass3<<<nblk, 256, 0, stream>>>(d_loff, d_sums, (uint32_t) nrec);
+      compact_text<<<8192, 128, 0, stream>>>(d_text, TEXT_STRIDE, d_llen, d_loff,
+                                             d_packed, (uint32_t) nrec);
+      uint32_t last_off, last_len;
+      CK(cudaMemcpyAsync(&last_off, d_loff + nrec - 1, 4, cudaMemcpyDeviceToHost, stream));
+      CK(cudaMemcpyAsync(&last_len, d_llen + nrec - 1, 4, cudaMemcpyDeviceToHost, stream));
+      CK(cudaStreamSynchronize(stream));
+      size_t tbytes = (size_t) last_off + last_len;
+      size_t cap = (size_t) max_r * TEXT_STRIDE / 4;
+      if (tbytes > cap) {
+        fprintf(stderr, "packed output %zu bytes exceeds the %zu reserved\n", tbytes, cap);
+        return 1;
+      }
+      CK(cudaMemcpyAsync(h_out, d_packed, tbytes, cudaMemcpyDeviceToHost, stream));
+      CK(cudaStreamSynchronize(stream));
+      size_t w = 0;
+      while (w < tbytes) {
+        ssize_t n = write(out_fd, h_out + w, tbytes - w);
+        if (n <= 0) { perror("write"); return 1; }
+        w += n;
+      }
+      out_bytes += tbytes;
+    }
 
     CK(cudaMemcpyAsync(h_call.data() + done_reads, d_call, nrec*4,
                        cudaMemcpyDeviceToHost, stream));
@@ -249,10 +306,18 @@ int main(int argc, char **argv) {
   }
   double el = now_s() - t0;
 
+  if (out_fd >= 0) { close(out_fd); }
   printf("\nend to end   %.3f s   %.2f Gbase/s   %.1f Mread/s   %.2f Mread total\n",
          el, ih.total_uncompressed * 0.4 / el / 1e9, done_reads / el / 1e6,
          done_reads / 1e6);
   printf("             (bases are about 40%% of the FASTQ bytes)\n");
+  if (out_bytes) {
+    uint32_t over = 0;
+    CK(cudaMemcpy(&over, d_over, 4, cudaMemcpyDeviceToHost));
+    printf("             wrote %.2f GB of output, %u lines truncated\n",
+           out_bytes / 1e9, over);
+    if (over) { fprintf(stderr, "some hit lists did not fit the slot\n"); return 1; }
+  }
 
   // ---- correctness, against classify's own calls ----
   FILE *rf = fopen(argv[6], "rb");
