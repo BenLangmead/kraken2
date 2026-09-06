@@ -115,7 +115,9 @@ struct HostFallback {
                            (unsigned long long) (last ? extid[last] : 0), run);
         last = taxa[i]; run = 1;
       }
-      if (last == AMBIG) n += snprintf(buf+n, sizeof buf-n, "A:%d", run);
+      // Kraken 2's last hit-list entry carries no trailing space, except in
+      // the ambiguous branch, which emits one.  Reproduced deliberately.
+      if (last == AMBIG) n += snprintf(buf+n, sizeof buf-n, "A:%d ", run);
       else n += snprintf(buf+n, sizeof buf-n, "%llu:%d",
                          (unsigned long long) (last ? extid[last] : 0), run);
     }
@@ -373,6 +375,7 @@ int main(int argc, char **argv) {
         d_ubuf, d_buoff, d_brec, ent[b0].uoff, (uint32_t) nb, ent[b0].rec,
         d_off, d_len, d_hoff, d_hlen);
 
+    if (out_path) CK(cudaMemsetAsync(d_amb, 0, nrec, stream));
     fused<<<8192, THREADS, 0, stream>>>(
         d_ubuf, d_off, d_len, (uint32_t) nrec, k, l, ssm, tog, mahv,
         d_table, capacity, (int) key_bits, (int) value_bits,
@@ -380,7 +383,6 @@ int main(int argc, char **argv) {
         d_hoff, d_hlen, d_text, TEXT_STRIDE, d_llen, d_over, d_amb);
 
     if (out_path) {
-      CK(cudaMemsetAsync(d_amb, 0, nrec, stream));
       uint32_t nblk = (uint32_t) ((nrec + 255) / 256);
       scan_pass1<<<nblk, 256, 0, stream>>>(d_llen, d_loff, d_sums, (uint32_t) nrec);
       scan_pass2<<<1, 1, 0, stream>>>(d_sums, nblk);
