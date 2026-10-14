@@ -29,6 +29,9 @@ struct Options {
   uint64_t min_clear_hash_value;
   bool deterministic_build;
   size_t cht_cell_bits;
+  bool blocked_table;
+  int blocked_partition_bits;
+  double blocked_load;
 };
 
 vector<string> ExtractNCBISequenceIDs(const string &header);

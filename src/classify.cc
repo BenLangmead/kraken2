@@ -18,6 +18,7 @@
 #include "k2_profile.h"
 #include "mmscanner.h"
 #include "compact_hash.h"
+#include "blocked_table.h"
 #include "kraken2_data.h"
 #include "aa_translate.h"
 #include "reports.h"
@@ -356,6 +357,11 @@ IndexData *load_index(Options &opts) {
     break;
   case CompactHash40:
     cht = new CompactHashTable<CompactHashCell40>(opts.index_filename, opts.use_memory_mapping);
+    break;
+  case BlockedExact:
+    if (! idx_opts.dna_db)
+      errx(EX_DATAERR, "blocked tables support only nucleotide databases");
+    cht = new BlockedTable(opts.index_filename, opts.use_memory_mapping);
     break;
   case Unknown:
     errx(1, "Unable to determine width of compact hash cell\n");

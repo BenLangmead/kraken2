@@ -20,6 +20,7 @@ typedef uint32_t hvalue_t;
 enum CellType {
   CompactHash32,
   CompactHash40,
+  BlockedExact,
   Unknown,
 };
 
@@ -41,6 +42,10 @@ CellType inline GetKVStoreCellType(std::string &filename) {
 
   std::ifstream ifs(filename);
   ifs.read((char *) &capacity, sizeof(capacity));
+  // A blocked table (blocked_table.h) starts with the bytes "K2BLKT01" in
+  // place of the compact hash table's capacity.
+  if (capacity == 0x3130544B4C42324BULL)
+    return BlockedExact;
   ifs.read((char *) &size, sizeof(size));
   ifs.read((char *) &key_bits, sizeof(key_bits));
   ifs.read((char *)&value_bits, sizeof(value_bits));

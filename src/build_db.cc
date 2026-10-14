@@ -9,6 +9,7 @@
 #include "taxonomy.h"
 #include "mmscanner.h"
 #include "compact_hash.h"
+#include "blocked_table.h"
 #include "kraken2_data.h"
 #include "utilities.h"
 
@@ -31,6 +32,9 @@ void ParseCommandLine(int argc, char **argv, Options &opts);
 void usage(int exit_code = EX_USAGE);
 void ReadIDToTaxonMap(map<string, taxid_t> &id_map, string &filename);
 void GenerateTaxonomy(Options &opts, map<string, taxid_t> &id_map);
+void BuildBlockedTable(const Taxonomy &taxonomy,
+    const map<string, taxid_t> &ID_to_taxon_map, const Options &opts,
+    size_t bits_for_taxid);
 
 struct TaxonSeqPair {
   taxid_t taxon;
@@ -50,6 +54,9 @@ int main(int argc, char **argv) {
   opts.min_clear_hash_value = 0;
   opts.maximum_capacity = 0;
   opts.deterministic_build = true;
+  opts.blocked_table = false;
+  opts.blocked_partition_bits = 8;
+  opts.blocked_load = 0.9;
   ParseCommandLine(argc, argv, opts);
 
   omp_set_num_threads( opts.num_threads );
@@ -83,7 +90,9 @@ int main(int argc, char **argv) {
     actual_capacity = opts.maximum_capacity;
   }
 
-  if (opts.cht_cell_size == 32) {
+  if (opts.blocked_table) {
+    BuildBlockedTable(taxonomy, ID_to_taxon_map, opts, bits_for_taxid);
+  } else if (opts.cht_cell_size == 32) {
     build<CompactHashCell>(taxonomy, ID_to_taxon_map, opts, actual_capacity, bits_for_taxid);
   } else if (opts.cht_cell_size == 40) {
     build<CompactHashCell40>(taxonomy, ID_to_taxon_map, opts, actual_capacity, bits_for_taxid);
@@ -179,7 +188,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
   int opt;
   long long sig;
 
-  while ((opt = getopt(argc, argv, "?hB:b:c:FH:m:n:o:t:k:l:M:p:r:s:S:T:XC:")) != -1) {
+  while ((opt = getopt(argc, argv, "?hB:b:c:FH:m:n:o:t:k:l:M:p:r:s:S:T:XC:YP:e:")) != -1) {
     switch (opt) {
       case 'h' : case '?' :
         usage(0);
@@ -264,6 +273,20 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
       case 'X' :
         opts.input_is_protein = true;
         break;
+      case 'Y' :
+        opts.blocked_table = true;
+        break;
+      case 'P' :
+        sig = atoll(optarg);
+        if (sig < 0 || sig > 16)
+          errx(EX_USAGE, "partition bits must be between 0 and 16");
+        opts.blocked_partition_bits = sig;
+        break;
+      case 'e' :
+        opts.blocked_load = atof(optarg);
+        if (opts.blocked_load <= 0 || opts.blocked_load >= 1)
+          errx(EX_USAGE, "blocked table load must be between 0 and 1");
+        break;
       case 'C':
         sig = atoll(optarg);
         if (sig != 32 && sig != 40)
@@ -285,7 +308,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
     cerr << "missing mandatory filename parameter" << endl;
     usage();
   }
-  if (opts.k == 0 || opts.l == 0 || opts.capacity == 0) {
+  if (opts.k == 0 || opts.l == 0 || (opts.capacity == 0 && ! opts.blocked_table)) {
     cerr << "missing mandatory integer parameter" << endl;
     usage();
   }
@@ -295,6 +318,14 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
   }
   if (opts.block_size < opts.subblock_size) {
     cerr << "block size cannot be less than subblock size\n";
+    usage();
+  }
+  if (opts.blocked_table && opts.maximum_capacity) {
+    cerr << "a blocked table cannot be subsampled with -M" << endl;
+    usage();
+  }
+  if (opts.blocked_table && opts.input_is_protein) {
+    cerr << "blocked tables support only nucleotide databases" << endl;
     usage();
   }
   if (opts.maximum_capacity > opts.capacity) {
@@ -324,6 +355,103 @@ void usage(int exit_code) {
        << "  -B INT        Read block size\n"
        << "  -b INT        Read subblock size\n"
        << "  -r INT        Bit storage requested for taxid\n"
-       << "  -C INT        CHT cell size (default: 32)" << endl;
+       << "  -C INT        CHT cell size (default: 32)\n"
+       << "  -Y            Build a blocked table instead of a compact hash table\n"
+       << "                (-c is then not needed)\n"
+       << "  -P INT        Blocked table partition bits (default: 8)\n"
+       << "  -e FLOAT      Blocked table slot load (default: 0.9)" << endl;
   exit(exit_code);
+}
+
+// Collects every (minimizer, taxon) pair of the library into a blocked
+// table.  Sequences are read one block at a time and scanned in parallel in
+// overlapping subblocks, as in ProcessSequences.  The table is a function of
+// the set of pairs alone, so the result does not depend on sequence order or
+// thread count.
+void BuildBlockedTable(const Taxonomy &taxonomy,
+    const map<string, taxid_t> &ID_to_taxon_map, const Options &opts,
+    size_t bits_for_taxid)
+{
+  uint64_t lmer_mask = (1ULL << (opts.l * BITS_PER_CHAR_DNA)) - 1;
+  uint64_t pext_mask = opts.spaced_seed_mask ?
+      (opts.spaced_seed_mask & lmer_mask) : lmer_mask;
+  BlockedTableBuilder builder(pext_mask, opts.blocked_partition_bits,
+                              opts.blocked_load, taxonomy);
+  int threads = opts.num_threads;
+  vector<BlockedTableBuilder::Buffer *> buffers(threads);
+  for (int t = 0; t < threads; t++)
+    buffers[t] = new BlockedTableBuilder::Buffer(builder);
+
+  struct Item { const string *seq; taxid_t taxid; size_t start, finish; };
+  vector<Item> items;
+  size_t processed_seq_ct = 0;
+  size_t processed_ch_ct = 0;
+  BatchSequenceReader reader;
+  Sequence *sequence;
+  while (reader.LoadBlock(opts.block_size)) {
+    items.clear();
+    while ((sequence = reader.NextSequence()) != NULL) {
+      auto all_sequence_ids = ExtractNCBISequenceIDs(sequence->header);
+      taxid_t taxid = 0;
+      for (auto &seqid : all_sequence_ids) {
+        if (ID_to_taxon_map.count(seqid) == 0 ||
+            ID_to_taxon_map.at(seqid) == 0)
+          continue;
+        taxid = taxonomy.LowestCommonAncestor(
+            taxid, taxonomy.GetInternalID(ID_to_taxon_map.at(seqid)));
+      }
+      if (! taxid)
+        continue;
+      const string &seq = sequence->seq;
+      // Consecutive subblocks overlap by k - 1 characters, so every k-mer
+      // lies wholly inside at least one of them.
+      for (size_t i = 0; i < seq.size(); i += opts.subblock_size) {
+        size_t finish = std::min(seq.size(), i + opts.subblock_size + opts.k - 1);
+        Item item = { &seq, taxid, i, finish };
+        items.push_back(item);
+        if (finish == seq.size())
+          break;
+      }
+      processed_seq_ct++;
+      processed_ch_ct += seq.size();
+    }
+    #pragma omp parallel num_threads(threads)
+    {
+      BlockedTableBuilder::Buffer &buf = *buffers[omp_get_thread_num()];
+      MinimizerScanner scanner(opts.k, opts.l, opts.spaced_seed_mask,
+                               true, opts.toggle_mask);
+      #pragma omp for schedule(dynamic, 64)
+      for (size_t n = 0; n < items.size(); n++) {
+        const Item &it = items[n];
+        scanner.LoadSequence(*it.seq, it.start, it.finish);
+        uint64_t *minimizer_ptr;
+        uint64_t last = UINT64_MAX;
+        while ((minimizer_ptr = scanner.NextMinimizer())) {
+          if (scanner.is_ambiguous())
+            continue;
+          uint64_t m = *minimizer_ptr;
+          if (m == last)
+            continue;
+          last = m;
+          if (opts.min_clear_hash_value &&
+              MurmurHash3(m) < opts.min_clear_hash_value)
+            continue;
+          buf.Add(m, (uint32_t) it.taxid);
+        }
+      }
+    }
+    if (isatty(fileno(stderr))) {
+      std::cerr << "\rProcessed " << processed_seq_ct << " sequences ("
+                << processed_ch_ct << " bp)...";
+    }
+  }
+  if (isatty(fileno(stderr)))
+    std::cerr << "\r";
+  std::cerr << "Completed processing of " << processed_seq_ct << " sequences, "
+            << processed_ch_ct << " bp" << std::endl;
+  for (int t = 0; t < threads; t++)
+    delete buffers[t];
+
+  std::cerr << "Placing blocked table... " << std::flush;
+  builder.Write(opts.hashtable_filename.c_str(), bits_for_taxid, threads);
 }

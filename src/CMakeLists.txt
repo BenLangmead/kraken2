@@ -1,5 +1,6 @@
 add_executable(build_db
         build_db.cc
+        blocked_table.cc
         mmap_file.cc
         compact_hash.cc
         taxonomy.cc
@@ -10,6 +11,7 @@ add_executable(build_db
 
 add_executable(classify
         classify.cc
+        blocked_table.cc
         reports.cc
         mmap_file.cc
         compact_hash.cc
