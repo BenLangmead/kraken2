@@ -21,7 +21,7 @@ were sharing one flag array, which is wrong because a minimizer the filter drops
 still counts as the previous reported one, and in the device version that same
 sharing was a read/write race between threads.
 
-The oracle both are checked against comes from `src/k2mindump.cc`.
+Both `emul` and `k2gpu` are checked against the output of `classify` itself.
 
 ## Building
 
