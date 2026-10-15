@@ -11,6 +11,36 @@
 static const int MAX_LEN = 320;
 static const int THREADS = 128;
 
+// What one launch of the fused kernel does.  CLASSIFY is the whole job for a
+// table that is resident.  The other three serve a blocked table that is
+// streamed in groups of whole partitions:
+//   PROBE_GROUP   recompute the minimizers, look up those whose partition is
+//                 in [part_lo, part_hi), and store each result in tok_tax
+//   BIN           compute the minimizers once and append each lookup's hash
+//                 and tok_tax index to its partition's bin, for probe_bins
+//   FINISH        recompute the minimizers, take each lookup's taxon from
+//                 tok_tax, and resolve and format as CLASSIFY does
+// Every key lives in exactly one partition and a lookup never leaves it, so
+// after all groups every lookup's entry in tok_tax holds what a resident
+// table returns.
+enum Phase { CLASSIFY = 0, PROBE_GROUP = 1, BIN = 2, FINISH = 3 };
+
+struct StreamArgs {
+  int phase;
+  // Taxon per k-mer position: read r of this launch, position p, is
+  // tok_tax[tok_base + r * tok_stride + p].  Only positions that start a run
+  // of equal minimizers are written and read.
+  uint16_t *tok_tax;
+  uint64_t tok_base;
+  uint32_t tok_stride;
+  uint32_t part_lo, part_hi;
+  // Bins for BIN: partition b holds bin_cnt[b] entries at [b * bin_cap, ...).
+  uint64_t *bin_h;
+  uint32_t *bin_i;
+  uint32_t *bin_cnt;
+  uint32_t bin_cap;
+};
+
 __host__ __device__ __forceinline__ uint64_t murmur(uint64_t k) { return k2t::murmur(k); }
 
 __device__ __forceinline__ uint64_t revcomp(uint64_t kmer, int n) {
@@ -67,7 +97,7 @@ __global__ void fused(const char *__restrict__ bases,
                       uint32_t n_reads, int k, int l,
                       uint64_t spaced_seed_mask, uint64_t toggle_mask,
                       uint64_t min_acceptable,
-                      const k2t::Table table, int skip_probe,
+                      const k2t::Table table, int skip_probe, const StreamArgs sa,
                       uint64_t *__restrict__ out_key,
                       uint32_t *__restrict__ out_tax,
                       uint32_t *__restrict__ out_count,
@@ -167,6 +197,30 @@ __global__ void fused(const char *__restrict__ bases,
     }
     __syncthreads();
 
+    // The PROBE_GROUP and BIN passes need only the lookup positions, not the
+    // compaction or the call, so they stop here.
+    uint16_t *tt = sa.tok_tax ? sa.tok_tax + sa.tok_base + (uint64_t) r * sa.tok_stride : nullptr;
+    if (sa.phase == PROBE_GROUP || sa.phase == BIN) {
+      for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
+        if (!look[p]) continue;
+        uint64_t h = table.G.hash(val[p]);
+        uint32_t part = (uint32_t) table.G.part_of(h);
+        if (sa.phase == PROBE_GROUP) {
+          if (part >= sa.part_lo && part < sa.part_hi)
+            tt[p] = (uint16_t) table.get_blocked_hash(h);
+        } else {
+          uint32_t at = atomicAdd(&sa.bin_cnt[part], 1u);
+          if (at < sa.bin_cap) {
+            uint64_t e = (uint64_t) part * sa.bin_cap + at;
+            sa.bin_h[e] = h;
+            sa.bin_i[e] = (uint32_t) (sa.tok_base + (uint64_t) r * sa.tok_stride + p);
+          }
+        }
+      }
+      __syncthreads();
+      continue;
+    }
+
     // Stable compaction: output order has to match the CPU's, so an atomic
     // counter will not do.  Hillis-Steele over the flags gives each surviving
     // position its index.
@@ -190,7 +244,8 @@ __global__ void fused(const char *__restrict__ bases,
     for (int p = threadIdx.x; p < n_kmer; p += blockDim.x)
       // skip_probe exists for timing: it removes the table lookup and nothing
       // else, so the difference in kernel time is the lookup's cost.
-      if (look[p]) ptax[p] = skip_probe ? 0u : table.get(val[p]);
+      if (look[p]) ptax[p] = sa.phase == FINISH ? (uint32_t) tt[p]
+                           : skip_probe ? 0u : table.get(val[p]);
     __syncthreads();
 
     // One entry per reported k-mer.  A repeat inherits the taxon found at the
@@ -277,6 +332,34 @@ __global__ void fused(const char *__restrict__ bases,
     }
     __syncthreads();
   }
+}
+
+// Looks up the binned minimizers of partitions [part_lo, part_hi), one thread
+// per minimizer.  Bins are visited in partition order, so the threads running
+// at any moment work within a few partitions, which can sit in L2.
+__global__ void probe_bins(const k2t::Table table,
+                           const uint64_t *__restrict__ bin_h,
+                           const uint32_t *__restrict__ bin_i,
+                           const uint32_t *__restrict__ bin_cnt, uint32_t bin_cap,
+                           uint32_t part_lo, uint32_t part_hi,
+                           uint16_t *__restrict__ tok_tax) {
+  uint64_t n = (uint64_t) (part_hi - part_lo) * bin_cap;
+  for (uint64_t j = blockIdx.x * (uint64_t) blockDim.x + threadIdx.x; j < n;
+       j += (uint64_t) gridDim.x * blockDim.x) {
+    uint32_t b = part_lo + (uint32_t) (j / bin_cap), e = (uint32_t) (j % bin_cap);
+    if (e >= bin_cnt[b]) continue;
+    uint64_t at = (uint64_t) b * bin_cap + e;
+    tok_tax[bin_i[at]] = (uint16_t) table.get_blocked_hash(bin_h[at]);
+  }
+}
+
+// Longest read of a chunk, which sets the per-read stride of tok_tax.
+__global__ void max_len(const uint32_t *__restrict__ len, uint32_t n,
+                        uint32_t *__restrict__ out) {
+  uint32_t m = 0;
+  for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    m = len[i] > m ? len[i] : m;
+  atomicMax(out, m);
 }
 
 // Splits a run of record-aligned BGZF blocks into per-read sequence spans.

@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
   cht.key_bits = (int) key_bits; cht.value_bits = (int) value_bits;
   int blocks = 8192;
   fused<<<blocks, THREADS>>>(d_b,d_o,d_l,(uint32_t)nr,k,l,ssm,tog,mahv,
-                             cht,0,
+                             cht,0,StreamArgs{},
                              d_key,d_tax,d_cnt,d_oo,d_parent,d_extid,d_call,
                              nullptr,nullptr,nullptr,0,nullptr,nullptr,nullptr);
   CK(cudaDeviceSynchronize());
@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
   CK(cudaEventRecord(a));
   for (int i = 0; i < reps; i++)
     fused<<<blocks, THREADS>>>(d_b,d_o,d_l,(uint32_t)nr,k,l,ssm,tog,mahv,
-                               cht,0,
+                               cht,0,StreamArgs{},
                                d_key,d_tax,d_cnt,d_oo,d_parent,d_extid,d_call,
                                nullptr,nullptr,nullptr,0,nullptr,nullptr,nullptr);
   CK(cudaEventRecord(b)); CK(cudaDeviceSynchronize());
