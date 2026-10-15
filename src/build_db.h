@@ -32,6 +32,7 @@ struct Options {
   bool blocked_table;
   int blocked_partition_bits;
   double blocked_load;
+  int blocked_remainder_bits;  // 0 means exact
 };
 
 vector<string> ExtractNCBISequenceIDs(const string &header);

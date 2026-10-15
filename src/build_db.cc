@@ -57,6 +57,7 @@ int main(int argc, char **argv) {
   opts.blocked_table = false;
   opts.blocked_partition_bits = 8;
   opts.blocked_load = 0.9;
+  opts.blocked_remainder_bits = 0;
   ParseCommandLine(argc, argv, opts);
 
   omp_set_num_threads( opts.num_threads );
@@ -188,7 +189,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
   int opt;
   long long sig;
 
-  while ((opt = getopt(argc, argv, "?hB:b:c:FH:m:n:o:t:k:l:M:p:r:s:S:T:XC:YP:e:")) != -1) {
+  while ((opt = getopt(argc, argv, "?hB:b:c:FH:m:n:o:t:k:l:M:p:r:s:S:T:XC:YP:e:R:")) != -1) {
     switch (opt) {
       case 'h' : case '?' :
         usage(0);
@@ -287,6 +288,12 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         if (opts.blocked_load <= 0 || opts.blocked_load >= 1)
           errx(EX_USAGE, "blocked table load must be between 0 and 1");
         break;
+      case 'R' :
+        sig = atoll(optarg);
+        if (sig < 1 || sig > 46)
+          errx(EX_USAGE, "blocked table remainder bits must be between 1 and 46");
+        opts.blocked_remainder_bits = sig;
+        break;
       case 'C':
         sig = atoll(optarg);
         if (sig != 32 && sig != 40)
@@ -359,7 +366,10 @@ void usage(int exit_code) {
        << "  -Y            Build a blocked table instead of a compact hash table\n"
        << "                (-c is then not needed)\n"
        << "  -P INT        Blocked table partition bits (default: 8)\n"
-       << "  -e FLOAT      Blocked table slot load (default: 0.9)" << endl;
+       << "  -e FLOAT      Blocked table slot load (default: 0.9)\n"
+       << "  -R INT        Blocked table remainder bits; below the exact width,\n"
+       << "                keys are stored as fingerprints and lookups can return\n"
+       << "                false positives (default: exact)" << endl;
   exit(exit_code);
 }
 
@@ -376,7 +386,8 @@ void BuildBlockedTable(const Taxonomy &taxonomy,
   uint64_t pext_mask = opts.spaced_seed_mask ?
       (opts.spaced_seed_mask & lmer_mask) : lmer_mask;
   BlockedTableBuilder builder(pext_mask, opts.blocked_partition_bits,
-                              opts.blocked_load, taxonomy);
+                              opts.blocked_load, taxonomy,
+                              opts.blocked_remainder_bits);
   int threads = opts.num_threads;
   vector<BlockedTableBuilder::Buffer *> buffers(threads);
   for (int t = 0; t < threads; t++)

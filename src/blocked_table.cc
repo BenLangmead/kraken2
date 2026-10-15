@@ -7,6 +7,8 @@
 #include "blocked_table.h"
 #include "compact_hash.h"
 
+#include <numeric>
+
 using std::string;
 using std::vector;
 using std::pair;
@@ -296,8 +298,10 @@ void BlockedTable::GetBatch(const hkey_t *keys, hvalue_t *out, size_t n) const {
 // ------------------------------------------------------------------ builder
 
 BlockedTableBuilder::BlockedTableBuilder(uint64_t pext_mask, int partition_bits,
-                                         double load, const Taxonomy &tax)
-    : pext_mask_(pext_mask), p_(partition_bits), load_(load), tax_(tax),
+                                         double load, const Taxonomy &tax,
+                                         int remainder_bits)
+    : pext_mask_(pext_mask), p_(partition_bits), load_(load),
+      remainder_bits_(remainder_bits), tax_(tax),
       parts_(1ULL << partition_bits), reduced_size_(1ULL << partition_bits, 0),
       locks_(1ULL << partition_bits) {
   pext_.init(pext_mask);
@@ -395,8 +399,14 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int value_bits, int th
   // nb depends on S, which depends on r.  Raising r only shrinks S, grows nb
   // and lowers the exact width, so the first r that reaches the exact width
   // is the smallest one that keeps every key distinct.  r starts high enough
-  // for the minimum slot width the lookup supports.
-  int r = std::max(1, BLOCKED_MIN_SLOT_BITS - value_bits), S = 0;
+  // for the minimum slot width the lookup supports.  A requested r is used
+  // as given.
+  int r = remainder_bits_ > 0 ? remainder_bits_
+                              : std::max(1, BLOCKED_MIN_SLOT_BITS - value_bits);
+  if (r + value_bits < BLOCKED_MIN_SLOT_BITS)
+    errx(EX_USAGE, "blocked table slot needs at least %d bits; raise -R to %d",
+         BLOCKED_MIN_SLOT_BITS, BLOCKED_MIN_SLOT_BITS - value_bits);
+  int S = 0, r_exact = 0;
   uint64_t nb = 0;
   while (true) {
     int w = r + value_bits;
@@ -407,11 +417,12 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int value_bits, int th
     if (nb < 2)
       nb = 2;
     uint64_t range = (uint64_t) ((((unsigned __int128) 1 << q) + nb - 1) / nb);
-    int r_exact = range <= 1 ? 1 : 64 - __builtin_clzll(range - 1);
-    if (r >= r_exact)
+    r_exact = range <= 1 ? 1 : 64 - __builtin_clzll(range - 1);
+    if (r >= r_exact || remainder_bits_ > 0)
       break;
     r++;
   }
+  const bool exact = r >= r_exact;
   if (S > 127)
     errx(EX_SOFTWARE, "blocked table bucket would hold %d slots", S);
 
@@ -428,23 +439,52 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int value_bits, int th
 
   vector<vector<uint64_t> > stash_keys(P);
   vector<vector<uint32_t> > stash_vals(P);
-  vector<uint64_t> guests(P, 0), spilled(P, 0);
+  vector<uint64_t> guests(P, 0), spilled(P, 0), stored(P, 0);
+  // Fingerprint mode: the taxon each record's lookup must return, which is
+  // the LCA of every record sharing its (home, rem).
+  vector<vector<uint32_t> > expect(exact ? 0 : P);
 
   #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
   for (uint64_t part = 0; part < P; part++) {
     const vector<Rec> &recs = parts_[part];
-    // Entries as (home << r | rem, taxon), sorted: recs are sorted by hash,
-    // and home and rem are nondecreasing in the low q bits of the hash.
+    // Entries as (home << r | rem, taxon), sorted.  In exact mode recs are
+    // sorted by hash, and home and rem are nondecreasing in the low q bits
+    // of the hash, so the entries are already sorted and distinct.  In
+    // fingerprint mode rem is the low r bits of the offset, so the entries
+    // are sorted and those with the same key merged by LCA.
     vector<pair<uint64_t, uint32_t> > e(recs.size());
     for (size_t i = 0; i < recs.size(); i++) {
       uint64_t low = recs[i].h & G.qmask;
       uint64_t home = (uint64_t) (((unsigned __int128) low * nb) >> q);
       uint64_t lo = (uint64_t) ((((unsigned __int128) home << q) + nb - 1) / nb);
       uint64_t rem = low - lo;
-      if (rem > rmask)
+      if (exact && rem > rmask)
         errx(EX_SOFTWARE, "remainder exceeds %d bits", r);
-      e[i] = std::make_pair((home << r) | rem, recs[i].taxid);
+      e[i] = std::make_pair((home << r) | (rem & rmask), recs[i].taxid);
     }
+    if (! exact) {
+      vector<uint32_t> order(e.size());
+      std::iota(order.begin(), order.end(), 0);
+      std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return e[a].first != e[b].first ? e[a].first < e[b].first : a < b;
+      });
+      vector<uint32_t> &ex = expect[part];
+      ex.resize(e.size());
+      vector<pair<uint64_t, uint32_t> > m;
+      for (size_t i = 0; i < order.size(); ) {
+        uint64_t key = e[order[i]].first;
+        size_t j = i;
+        uint64_t t = 0;
+        while (j < order.size() && e[order[j]].first == key)
+          t = tax_.LowestCommonAncestor(t, e[order[j++]].second);
+        for (size_t a = i; a < j; a++)
+          ex[order[a]] = (uint32_t) t;
+        m.push_back(std::make_pair(key, (uint32_t) t));
+        i = j;
+      }
+      e.swap(m);
+    }
+    stored[part] = e.size();
     uint64_t base = part * nb;
     // Placement on a flat slot array: cnt[b] entries of bucket b live in
     // slot[b*S .. b*S+cnt[b]), as indices into e; at_alt[i] says whether
@@ -625,7 +665,10 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int value_bits, int th
   hdr.slots = S;
   hdr.spill_bits = sf;
   hdr.buckets_per_partition = nb;
-  hdr.entries = N;
+  uint64_t entries = 0;
+  for (uint64_t part = 0; part < P; part++)
+    entries += stored[part];
+  hdr.entries = entries;
   hdr.stash_entries = skeys.size();
   hdr.pext_mask = pext_mask_;
   for (uint64_t part = 0; part < P; part++) {
@@ -633,8 +676,8 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int value_bits, int th
     hdr.spilled_buckets += spilled[part];
   }
 
-  // Self-check: every key must come back with its own taxon through the
-  // same lookup code classify uses.
+  // Self-check: every key must come back with its own taxon (in fingerprint
+  // mode, the LCA of its entry) through the same lookup code classify uses.
   {
     BlockedTable T;
     T.header_ = hdr;
@@ -645,9 +688,11 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int value_bits, int th
     T.Init();
     uint64_t bad = 0;
     #pragma omp parallel for schedule(dynamic, 1) reduction(+:bad) num_threads(threads)
-    for (uint64_t part = 0; part < P; part++)
-      for (auto &rec : parts_[part])
-        bad += T.GetByHash(rec.h) != rec.taxid;
+    for (uint64_t part = 0; part < P; part++) {
+      const vector<Rec> &recs = parts_[part];
+      for (size_t i = 0; i < recs.size(); i++)
+        bad += T.GetByHash(recs[i].h) != (exact ? recs[i].taxid : expect[part][i]);
+    }
     if (bad)
       errx(EX_SOFTWARE, "blocked table self-check failed for %llu keys",
            (unsigned long long) bad);
@@ -670,11 +715,22 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int value_bits, int th
     err(EX_IOERR, "error writing %s", filename);
   free(table);
 
-  std::cerr << "Blocked table: " << N << " keys, " << P << " partitions of "
-            << nb << " buckets, r = " << r << ", v = " << value_bits
+  // Records whose own taxon differs from the LCA they now share.
+  uint64_t merged_changed = 0;
+  if (! exact)
+    for (uint64_t part = 0; part < P; part++)
+      for (size_t i = 0; i < parts_[part].size(); i++)
+        merged_changed += parts_[part][i].taxid != expect[part][i];
+  std::cerr << "Blocked table: " << N << " keys";
+  if (! exact)
+    std::cerr << " in " << entries << " entries (" << merged_changed
+              << " keys with a merged taxon)";
+  std::cerr << ", " << P << " partitions of "
+            << nb << " buckets, " << (exact ? "exact" : "fingerprint")
+            << " r = " << r << " (exact " << r_exact << "), v = " << value_bits
             << ", " << S << " slots of " << w << " bits, spill filter "
             << sf << " bits, " << (double) bucket_bytes * 8 / N
-            << " bits/key, load " << (double) N / (P * nb * S)
+            << " bits/key, load " << (double) entries / (P * nb * S)
             << ", guests " << hdr.guests << ", stash " << hdr.stash_entries
             << std::endl;
   return N;
