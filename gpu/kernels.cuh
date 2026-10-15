@@ -7,9 +7,12 @@
 #include <cstdint>
 #include <cuda_runtime_api.h>
 #include "table.h"
+#include "classify_core.h"
 
 static const int MAX_LEN = 320;
 static const int THREADS = 128;
+
+__host__ __device__ __forceinline__ uint64_t murmur(uint64_t k) { return k2t::murmur(k); }
 
 // What one launch of the fused kernel does.  CLASSIFY is the whole job for a
 // table that is resident.  The other three serve a blocked table that is
@@ -17,91 +20,82 @@ static const int THREADS = 128;
 //   PROBE_GROUP   recompute the minimizers, look up those whose partition is
 //                 in [part_lo, part_hi), and store each result in tok_tax
 //   BIN           compute the minimizers once and append each lookup's hash
-//                 and tok_tax index to its partition's bin, for probe_bins
+//                 to its partition's bin, recording in tok_ref which bin
+//                 entry will hold its result, for probe_bins
 //   FINISH        recompute the minimizers, take each lookup's taxon from
-//                 tok_tax, and resolve and format as CLASSIFY does
+//                 tok_tax (or through tok_ref from bin_v), and resolve and
+//                 format as CLASSIFY does
 // Every key lives in exactly one partition and a lookup never leaves it, so
-// after all groups every lookup's entry in tok_tax holds what a resident
-// table returns.
+// after all groups every lookup has the value a resident table gives.
 enum Phase { CLASSIFY = 0, PROBE_GROUP = 1, BIN = 2, FINISH = 3 };
 
 struct StreamArgs {
   int phase;
-  // Taxon per k-mer position: read r of this launch, position p, is
-  // tok_tax[tok_base + r * tok_stride + p].  Only positions that start a run
-  // of equal minimizers are written and read.
+  // Per-token state: token t of mate m of unit r of this launch is entry
+  // tok_base + r * tok_stride + m * mate_stride + t.  Only tokens that are
+  // lookups are written and read.  tok_tax holds taxa (rescan); tok_ref holds
+  // bin entry indices (bins).
   uint16_t *tok_tax;
+  uint32_t *tok_ref;
   uint64_t tok_base;
-  uint32_t tok_stride;
+  uint32_t tok_stride, mate_stride;
   uint32_t part_lo, part_hi;
-  // Bins for BIN: partition b holds bin_cnt[b] entries at [b * bin_cap, ...).
+  // Bins for BIN: partition b of this launch's chunk holds bin_cnt[b]
+  // entries at bin_base + b * bin_cap + i; probe_bins stores each result at
+  // the same index of bin_v.
   uint64_t *bin_h;
-  uint32_t *bin_i;
+  uint16_t *bin_v;
   uint32_t *bin_cnt;
   uint32_t bin_cap;
+  uint64_t bin_base;
 };
 
-__host__ __device__ __forceinline__ uint64_t murmur(uint64_t k) { return k2t::murmur(k); }
-
-__device__ __forceinline__ uint64_t revcomp(uint64_t kmer, int n) {
-  kmer = ((kmer & 0xCCCCCCCCCCCCCCCCULL) >> 2) | ((kmer & 0x3333333333333333ULL) << 2);
-  kmer = ((kmer & 0xF0F0F0F0F0F0F0F0ULL) >> 4) | ((kmer & 0x0F0F0F0F0F0F0F0FULL) << 4);
-  kmer = ((kmer & 0xFF00FF00FF00FF00ULL) >> 8) | ((kmer & 0x00FF00FF00FF00FFULL) << 8);
-  kmer = ((kmer & 0xFFFF0000FFFF0000ULL) >> 16) | ((kmer & 0x0000FFFF0000FFFFULL) << 16);
-  kmer = (kmer >> 32) | (kmer << 32);
-  return ((~kmer) >> (64 - n * 2)) & ((1ULL << (n * 2)) - 1);
-}
-
-__device__ __forceinline__ bool is_ancestor(const uint64_t *__restrict__ parent,
-                                            uint64_t a, uint64_t b) {
-  if (!a || !b) return false;
-  while (b > a) b = parent[b];
-  return b == a;
-}
-
-__device__ __forceinline__ uint64_t lca(const uint64_t *__restrict__ parent,
-                                        uint64_t a, uint64_t b) {
-  if (!a || !b) return a ? a : b;
-  while (a != b) { if (a > b) a = parent[a]; else b = parent[b]; }
-  return a;
-}
-
-// Kraken 2's tree resolution over the few distinct taxa one read hits.  Ties
-// fold with the lowest common ancestor, which is commutative and associative,
-// so the answer does not depend on visiting order -- which matters, because the
-// CPU walks an unordered_map.
-__device__ uint32_t resolve(const uint64_t *__restrict__ parent,
-                            const uint32_t *tax, const uint32_t *cnt, int n) {
-  uint64_t max_taxon = 0; uint32_t max_score = 0;
-  for (int i = 0; i < n; i++) {
-    uint32_t score = 0;
-    for (int j = 0; j < n; j++)
-      if (is_ancestor(parent, tax[j], tax[i])) score += cnt[j];
-    if (score > max_score) { max_score = score; max_taxon = tax[i]; }
-    else if (score == max_score) max_taxon = lca(parent, max_taxon, tax[i]);
+// The work of one lookup token in each phase.  pos is the token's index in
+// tok_tax / tok_ref.  Returns the taxon in CLASSIFY and FINISH.
+__device__ __forceinline__ uint32_t lookup_token(const k2t::Table &table, const StreamArgs &sa,
+                                                 int skip_probe, uint64_t key, uint64_t pos) {
+  switch (sa.phase) {
+    case PROBE_GROUP: {
+      uint64_t h = table.G.hash(key);
+      uint32_t part = (uint32_t) table.G.part_of(h);
+      if (part >= sa.part_lo && part < sa.part_hi)
+        sa.tok_tax[pos] = (uint16_t) table.get_blocked_hash(h);
+      return 0;
+    }
+    case BIN: {
+      uint64_t h = table.G.hash(key);
+      uint32_t part = (uint32_t) table.G.part_of(h);
+      uint32_t at = atomicAdd(&sa.bin_cnt[part], 1u);
+      if (at < sa.bin_cap) {
+        uint64_t e = sa.bin_base + (uint64_t) part * sa.bin_cap + at;
+        sa.bin_h[e] = h;
+        sa.tok_ref[pos] = (uint32_t) e;
+      }
+      return 0;
+    }
+    case FINISH:
+      return sa.tok_ref ? (uint32_t) sa.bin_v[sa.tok_ref[pos]] : (uint32_t) sa.tok_tax[pos];
+    default:
+      // skip_probe exists for timing: it removes the table lookup and nothing
+      // else, so the difference in kernel time is the lookup's cost.
+      return skip_probe ? 0u : table.get(key);
   }
-  return (uint32_t) max_taxon;
 }
 
-__device__ __forceinline__ int put_u64(char *p, uint64_t v) {
-  if (v == 0) { p[0] = '0'; return 1; }
-  char t[24]; int n = 0;
-  while (v) { t[n++] = (char) ('0' + (v % 10)); v /= 10; }
-  for (int i = 0; i < n; i++) p[i] = t[n - 1 - i];
-  return n;
-}
-
+// One block per unit, where a unit is a read or, with mates == 2, a pair of
+// consecutive records.  A mate with no ambiguous base is scanned in parallel:
+// every k-mer is a token.  A mate with an ambiguous base is scanned by thread
+// 0 with Kraken 2's own scanner logic (k2c::Scanner), which reproduces the
+// ambiguous tokens it emits while refilling after such a base.  Tokens of both
+// mates and the mate border go into stax, then one thread resolves the call
+// and formats the line.
 __global__ void fused(const char *__restrict__ bases,
                       const uint32_t *__restrict__ offsets,
                       const uint32_t *__restrict__ lengths,
-                      uint32_t n_reads, int k, int l,
+                      uint32_t n_units, int mates, int k, int l,
                       uint64_t spaced_seed_mask, uint64_t toggle_mask,
                       uint64_t min_acceptable,
                       const k2t::Table table, int skip_probe, const StreamArgs sa,
-                      uint64_t *__restrict__ out_key,
-                      uint32_t *__restrict__ out_tax,
-                      uint32_t *__restrict__ out_count,
-                      const uint32_t *__restrict__ out_offsets,
                       const uint64_t *__restrict__ parent,
                       const uint64_t *__restrict__ extid,
                       uint32_t *__restrict__ out_call,
@@ -109,225 +103,142 @@ __global__ void fused(const char *__restrict__ bases,
                       const uint32_t *__restrict__ hdr_len,
                       char *__restrict__ out_text, uint32_t text_stride,
                       uint32_t *__restrict__ out_linelen,
-                      uint32_t *__restrict__ out_overflow,
-                      uint8_t *__restrict__ out_amb) {
+                      uint32_t *__restrict__ out_overflow) {
   __shared__ uint64_t cand[MAX_LEN];
   __shared__ uint8_t  code[MAX_LEN];
   __shared__ uint64_t val[MAX_LEN];
-  __shared__ int      flag[MAX_LEN];
   __shared__ int      look[MAX_LEN];
-  __shared__ int      scan[MAX_LEN];
-  __shared__ int      tmp[MAX_LEN];
-  __shared__ uint32_t stax[MAX_LEN];
   __shared__ uint32_t ptax[MAX_LEN];
-  __shared__ int amb_read;
+  __shared__ uint32_t stax[2 * MAX_LEN + 1];
+  __shared__ int amb_mate, n_tok, mate_len[2];
+  const bool tokens_wanted = sa.phase == CLASSIFY || sa.phase == FINISH;
 
-  for (uint32_t r = blockIdx.x; r < n_reads; r += gridDim.x) {
-    const char *seq = bases + offsets[r];
-    int len = (int) lengths[r];
-    if (len > MAX_LEN) len = MAX_LEN;
-
-    if (threadIdx.x == 0) amb_read = 0;
-    __syncthreads();
-    for (int i = threadIdx.x; i < len; i += blockDim.x) {
-      char c = seq[i]; uint8_t v;
-      switch (c) {
-        case 'A': case 'a': v = 0; break;
-        case 'C': case 'c': v = 1; break;
-        case 'G': case 'g': v = 2; break;
-        case 'T': case 't': v = 3; break;
-        default:  v = 4; break;
+  for (uint32_t r = blockIdx.x; r < n_units; r += gridDim.x) {
+    if (threadIdx.x == 0) n_tok = 0;
+    for (int m = 0; m < mates; m++) {
+      uint32_t rec = r * mates + m;
+      const char *seq = bases + offsets[rec];
+      int len = (int) lengths[rec];
+      if (threadIdx.x == 0) {
+        amb_mate = 0; mate_len[m] = len;
+        // Shared memory is sized for MAX_LEN; a longer read would need a
+        // different arrangement, so it is reported rather than truncated.
+        if (len > MAX_LEN && out_overflow) atomicAdd(out_overflow, 1u);
       }
-      code[i] = v;
-      if (v == 4) amb_read = 1;
-    }
-    __syncthreads();
+      if (len > MAX_LEN) len = MAX_LEN;
+      __syncthreads();
+      uint64_t tbase = sa.tok_base + (uint64_t) r * sa.tok_stride + (uint64_t) m * sa.mate_stride;
 
-    int n_lmer = len - l + 1; if (n_lmer < 1) n_lmer = 0;
-    const uint64_t lmask = (l * 2 >= 64) ? ~0ULL : ((1ULL << (l * 2)) - 1);
-    for (int i = threadIdx.x; i < n_lmer; i += blockDim.x) {
-      uint64_t lmer = 0; bool amb = false;
-      for (int j = 0; j < l; j++) {
-        uint8_t v = code[i + j];
-        if (v == 4) { amb = true; break; }
-        lmer = (lmer << 2) | v;
+      for (int i = threadIdx.x; i < len; i += blockDim.x) {
+        int v = k2c::base_code(seq[i]);
+        code[i] = (uint8_t) (v < 0 ? 4 : v);
+        if (v < 0) amb_mate = 1;
       }
-      if (amb) { cand[i] = ~0ULL; continue; }
-      lmer &= lmask;
-      uint64_t rc = revcomp(lmer, l);
-      uint64_t canon = lmer < rc ? lmer : rc;
-      if (spaced_seed_mask) canon &= spaced_seed_mask;
-      cand[i] = canon ^ toggle_mask;
-    }
-    __syncthreads();
+      __syncthreads();
 
-    int n_kmer = len - k + 1; if (n_kmer < 1) n_kmer = 0;
-    int win = k - l + 1;
+      if (amb_mate) {
+        // Sequential: as ScanFragmentTokens and ResolveFragmentTokens do,
+        // token by token.
+        if (threadIdx.x == 0) {
+          k2c::Scanner sc;
+          sc.init(k, l, spaced_seed_mask, toggle_mask);
+          sc.load(seq, len);
+          uint64_t mz, last_min = ~0ULL; bool amb;
+          uint32_t last_taxon = 0;
+          int t = 0;
+          while (sc.next(&mz, &amb)) {
+            uint32_t taxon;
+            if (amb) taxon = k2c::AMBIG;
+            else if (mz != last_min) {
+              last_min = mz;
+              if (min_acceptable && murmur(mz) < min_acceptable) taxon = 0;
+              else taxon = lookup_token(table, sa, skip_probe, mz, tbase + t);
+              last_taxon = taxon;
+            } else taxon = last_taxon;
+            if (tokens_wanted) stax[n_tok + t] = taxon;
+            t++;
+          }
+          n_tok += t;
+        }
+      } else {
+        int n_lmer = len - l + 1; if (n_lmer < 1) n_lmer = 0;
+        const uint64_t lmask = (l * 2 >= 64) ? ~0ULL : ((1ULL << (l * 2)) - 1);
+        for (int i = threadIdx.x; i < n_lmer; i += blockDim.x) {
+          uint64_t lmer = 0;
+          for (int j = 0; j < l; j++) lmer = (lmer << 2) | code[i + j];
+          lmer &= lmask;
+          uint64_t rc = k2c::revcomp(lmer, l);
+          uint64_t canon = lmer < rc ? lmer : rc;
+          if (spaced_seed_mask) canon &= spaced_seed_mask;
+          cand[i] = canon ^ toggle_mask;
+        }
+        __syncthreads();
 
-    // Every k-mer whose window holds k - l + 1 unambiguous l-mers reports a
-    // token, as MinimizerScanner::NextMinimizer does once per k-mer.
-    for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
-      uint64_t m = ~0ULL; bool ok = true;
-      for (int j = 0; j < win; j++) {
-        uint64_t c = cand[p + j];
-        if (c == ~0ULL) { ok = false; break; }
-        if (c < m) m = c;
-      }
-      val[p] = ok ? (m ^ toggle_mask) : 0;
-      flag[p] = ok ? 1 : 0;
-    }
-    __syncthreads();
+        // Every k-mer is a token, as MinimizerScanner::NextMinimizer returns
+        // once per k-mer when the read has no ambiguous base.
+        int n_kmer = len - k + 1; if (n_kmer < 1) n_kmer = 0;
+        int win = k - l + 1;
+        for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
+          uint64_t mn = ~0ULL;
+          for (int j = 0; j < win; j++) { uint64_t c = cand[p + j]; if (c < mn) mn = c; }
+          val[p] = mn ^ toggle_mask;
+        }
+        __syncthreads();
 
-    // Consecutive equal minimizers are one lookup, and the subsampling filter
-    // drops most of what is left.  These are two independent rejections and
-    // have to stay in separate arrays: a minimizer the filter drops still
-    // counts as the previous reported one for duplicate detection, because
-    // ClassifySequence assigns last_minimizer before deciding to skip.  Writing
-    // both into flag[] would also race, since other threads read flag[] while
-    // walking back to find the previous reporting position.
-    for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
-      int keep = flag[p];
-      if (keep) {
-        int q = p - 1;
-        while (q >= 0 && !flag[q]) q--;
-        if (q >= 0 && val[q] == val[p]) keep = 0;
-        else if (min_acceptable && murmur(val[p]) < min_acceptable) keep = 0;
-      }
-      look[p] = keep;
-    }
-    __syncthreads();
+        // One lookup per run of equal consecutive minimizers, at the run's
+        // first k-mer, unless the subsampling filter drops it: the CPU looks
+        // a minimizer up only when it differs from the previous one.
+        for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
+          int keep = (p == 0 || val[p - 1] != val[p]);
+          if (keep && min_acceptable && murmur(val[p]) < min_acceptable) keep = 0;
+          look[p] = keep;
+          if (keep) ptax[p] = lookup_token(table, sa, skip_probe, val[p], tbase + p);
+        }
+        __syncthreads();
 
-    // The PROBE_GROUP and BIN passes need only the lookup positions, not the
-    // compaction or the call, so they stop here.
-    uint16_t *tt = sa.tok_tax ? sa.tok_tax + sa.tok_base + (uint64_t) r * sa.tok_stride : nullptr;
-    if (sa.phase == PROBE_GROUP || sa.phase == BIN) {
-      for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
-        if (!look[p]) continue;
-        uint64_t h = table.G.hash(val[p]);
-        uint32_t part = (uint32_t) table.G.part_of(h);
-        if (sa.phase == PROBE_GROUP) {
-          if (part >= sa.part_lo && part < sa.part_hi)
-            tt[p] = (uint16_t) table.get_blocked_hash(h);
-        } else {
-          uint32_t at = atomicAdd(&sa.bin_cnt[part], 1u);
-          if (at < sa.bin_cap) {
-            uint64_t e = (uint64_t) part * sa.bin_cap + at;
-            sa.bin_h[e] = h;
-            sa.bin_i[e] = (uint32_t) (sa.tok_base + (uint64_t) r * sa.tok_stride + p);
+        // A repeat inherits the taxon found at the start of its run, and a
+        // run whose start the filter dropped contributes zero, which is what
+        // last_taxon does sequentially on the CPU.
+        if (tokens_wanted) {
+          for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
+            int s = p;
+            while (s > 0 && val[s - 1] == val[p]) s--;
+            stax[n_tok + p] = look[s] ? ptax[s] : 0u;
           }
         }
+        __syncthreads();
+        if (threadIdx.x == 0) n_tok += n_kmer;
       }
       __syncthreads();
-      continue;
-    }
-
-    // Stable compaction: output order has to match the CPU's, so an atomic
-    // counter will not do.  Hillis-Steele over the flags gives each surviving
-    // position its index.
-    for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) scan[p] = flag[p];
-    __syncthreads();
-    // Double buffered: reading and writing one array in place would race
-    // between threads within a step.
-    for (int off = 1; off < n_kmer; off <<= 1) {
-      for (int p = threadIdx.x; p < n_kmer; p += blockDim.x)
-        tmp[p] = (p >= off) ? scan[p] + scan[p - off] : scan[p];
-      __syncthreads();
-      for (int p = threadIdx.x; p < n_kmer; p += blockDim.x)
-        scan[p] = tmp[p];
-      __syncthreads();
-    }
-
-    // One table lookup per run of equal consecutive minimizers, at the run's
-    // first k-mer, unless the subsampling filter dropped it; look[] marks
-    // exactly those positions.  This is the CPU's rule: ClassifySequence looks
-    // a minimizer up only when it differs from the previous one.
-    for (int p = threadIdx.x; p < n_kmer; p += blockDim.x)
-      // skip_probe exists for timing: it removes the table lookup and nothing
-      // else, so the difference in kernel time is the lookup's cost.
-      if (look[p]) ptax[p] = sa.phase == FINISH ? (uint32_t) tt[p]
-                           : skip_probe ? 0u : table.get(val[p]);
-    __syncthreads();
-
-    // One entry per reported k-mer.  A repeat inherits the taxon found at the
-    // start of its equal-value run, and a run whose start the subsampling
-    // filter dropped contributes zero, which is what last_taxon does
-    // sequentially on the CPU.  The run start is a short walk back.
-    uint32_t obase = out_offsets ? out_offsets[r] : 0u;
-    for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
-      if (!flag[p]) continue;
-      int start = p, q = p - 1;
-      while (true) {
-        while (q >= 0 && !flag[q]) q--;
-        if (q < 0 || val[q] != val[p]) break;
-        start = q; q--;
+      if (threadIdx.x == 0 && mates == 2 && m == 0) {
+        if (tokens_wanted) stax[n_tok] = k2c::MATE;
+        n_tok++;
       }
-      int slot = scan[p] - 1;
-      uint32_t t = look[start] ? ptax[start] : 0u;
-      if (out_key) out_key[obase + slot] = val[p];
-      if (out_tax) out_tax[obase + slot] = t;
-      stax[slot] = t;
+      __syncthreads();
     }
-    __syncthreads();
+    if (!tokens_wanted) continue;
+
     // Counting distinct taxa and resolving the tree is a few dozen operations
     // on a handful of values, so one thread does it rather than paying for a
     // reduction across the block.
     if (threadIdx.x == 0) {
-      int n = n_kmer ? scan[n_kmer - 1] : 0;
-      if (out_count) out_count[r] = (uint32_t) n;
-      uint32_t tx[64], ct[64]; int nd = 0;
-      for (int j = 0; j < n; j++) {
-        uint32_t t = stax[j];
-        if (!t) continue;
-        int q = 0; while (q < nd && tx[q] != t) q++;
-        if (q == nd) { if (nd < 64) { tx[nd] = t; ct[nd] = 1; nd++; } }
-        else ct[q]++;
-      }
-      uint32_t call = resolve(parent, tx, ct, nd);
-      uint64_t ext_call = call ? extid[call] : 0;
-      out_call[r] = (uint32_t) ext_call;
-
-      // A read carrying an ambiguous base is handed back to the host.  Kraken 2
-      // emits a token per character while its scanner refills after one, which
-      // this kernel does not reproduce, and getting it wrong changes the
-      // confidence denominator.  Rather than model that here for the roughly one
-      // read in a million that needs it, the line is left empty and the host
-      // reclassifies with the original scanner.
-      if (amb_read) {
-        if (out_linelen) out_linelen[r] = 0;
-        if (out_amb) out_amb[r] = 1;
-      }
-      else if (out_text) {
-        // A hit list has one run per reported minimizer, so a long read with
-        // no repeats can produce a long line.  Rather than size the slot for
-        // the worst case everywhere, stop short of the end and report it, so a
+      uint32_t call = k2c::call_of(parent, stax, n_tok);
+      out_call[r] = (uint32_t) (call ? extid[call] : 0);
+      if (out_text) {
+        // A hit list has one run per change of taxon, so a long read can
+        // produce a long line.  Rather than size the slot for the worst case,
+        // the formatter stops short of the end and reports it, so a
         // too-narrow slot shows up as a counted failure instead of a
         // neighbouring line quietly overwritten.
-        char *w = out_text + (size_t) r * text_stride;
-        char *w0 = w;
-        char *wend = w0 + text_stride - 24;
-        *w++ = call ? 'C' : 'U'; *w++ = '\t';
-        const char *h = bases + hdr_off[r];
-        for (uint32_t i = 0; i < hdr_len[r]; i++) *w++ = h[i];
-        *w++ = '\t';
-        w += put_u64(w, ext_call); *w++ = '\t';
-        w += put_u64(w, (uint64_t) len); *w++ = '\t';
-        if (n == 0) { *w++='0'; *w++=':'; *w++='0'; }
-        else {
-          uint32_t last = stax[0]; int run = 1;
-          bool over = false;
-          for (int j = 1; j < n; j++) {
-            if (stax[j] == last) { run++; continue; }
-            if (w >= wend) { over = true; break; }
-            w += put_u64(w, last ? extid[last] : 0);
-            *w++ = ':'; w += put_u64(w, (uint64_t) run); *w++ = ' ';
-            last = stax[j]; run = 1;
-          }
-          if (over) atomicAdd(out_overflow, 1u);
-          w += put_u64(w, last ? extid[last] : 0);
-          *w++ = ':'; w += put_u64(w, (uint64_t) run);
-        }
-        *w++ = '\n';
-        out_linelen[r] = (uint32_t) (w - w0);
+        char *w0 = out_text + (size_t) r * text_stride;
+        uint32_t rec0 = r * mates;
+        bool over = false;
+        int n = k2c::format_line(w0, w0 + text_stride - 64, call, extid,
+                                 bases + hdr_off[rec0], hdr_len[rec0], mates == 2,
+                                 (uint32_t) mate_len[0], mates == 2 ? (uint32_t) mate_len[1] : 0u,
+                                 stax, n_tok, &over);
+        if (over) atomicAdd(out_overflow, 1u);
+        out_linelen[r] = (uint32_t) n;
       }
     }
     __syncthreads();
@@ -335,28 +246,30 @@ __global__ void fused(const char *__restrict__ bases,
 }
 
 // Looks up the binned minimizers of partitions [part_lo, part_hi), one thread
-// per minimizer.  Bins are visited in partition order, so the threads running
-// at any moment work within a few partitions, which can sit in L2.
+// per minimizer, and stores each result next to its minimizer.  Bins are
+// visited in partition order, so the threads running at any moment work
+// within a few partitions, which can sit in L2, and both the reads and the
+// stores are sequential.
 __global__ void probe_bins(const k2t::Table table,
                            const uint64_t *__restrict__ bin_h,
-                           const uint32_t *__restrict__ bin_i,
+                           uint16_t *__restrict__ bin_v,
                            const uint32_t *__restrict__ bin_cnt, uint32_t bin_cap,
-                           uint32_t part_lo, uint32_t part_hi,
-                           uint16_t *__restrict__ tok_tax, int no_write) {
+                           uint64_t bin_base, uint32_t part_lo, uint32_t part_hi,
+                           int no_write) {
   uint64_t n = (uint64_t) (part_hi - part_lo) * bin_cap;
   for (uint64_t j = blockIdx.x * (uint64_t) blockDim.x + threadIdx.x; j < n;
        j += (uint64_t) gridDim.x * blockDim.x) {
     uint32_t b = part_lo + (uint32_t) (j / bin_cap), e = (uint32_t) (j % bin_cap);
     if (e >= bin_cnt[b]) continue;
-    uint64_t at = (uint64_t) b * bin_cap + e;
+    uint64_t at = bin_base + (uint64_t) b * bin_cap + e;
     uint32_t v = table.get_blocked_hash(bin_h[at]);
     // A taxon never equals 0xFFFF0000, so with no_write nothing is stored,
     // but the lookup cannot be optimized away.
-    if (!no_write || v == 0xFFFF0000u) tok_tax[bin_i[at]] = (uint16_t) v;
+    if (!no_write || v == 0xFFFF0000u) bin_v[at] = (uint16_t) v;
   }
 }
 
-// Longest read of a chunk, which sets the per-read stride of tok_tax.
+// Longest read of a chunk, which sets the per-mate stride of the token state.
 __global__ void max_len(const uint32_t *__restrict__ len, uint32_t n,
                         uint32_t *__restrict__ out) {
   uint32_t m = 0;

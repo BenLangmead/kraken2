@@ -5,6 +5,11 @@
  * seeks to a block never has to scan for a record boundary, and two mate files
  * can be claimed by record range independently.  See bgzf_index.h.
  *
+ * Given two mate files, it writes their records interleaved (mate 1, mate 2,
+ * mate 1, ...) and ends blocks only between pairs, so every block holds whole
+ * pairs.  The index then has version 2, which readers of single-end files
+ * reject.
+ *
  * The output is ordinary BGZF, so it stays a valid gzip file: gunzip, and any
  * tool that reads .gz, sees the original bytes.  Ending blocks on record
  * boundaries costs about a quarter of a percent of compression ratio, since a
@@ -155,12 +160,15 @@ int main(int argc, char **argv) {
       case 'l': level = atoi(optarg); break;
       default:
         std::cerr << "usage: k2bgzf [-t threads] [-b block_bytes] [-l level]"
-                  << " -o out.k2bgz -i out.k2i in.fq" << std::endl;
+                  << " -o out.k2bgz -i out.k2i in.fq [mate2.fq]" << std::endl;
         return 1;
     }
   }
+  const char *in2_path = NULL;
   if (optind < argc)
     in_path = argv[optind];
+  if (optind + 1 < argc)
+    in2_path = argv[optind + 1];
   if (! out_path || ! idx_path)
     errx(EX_USAGE, "-o and -i are both required");
   if (target > BGZF_MAX_BLOCK - BGZF_FRAMING)
@@ -176,6 +184,11 @@ int main(int argc, char **argv) {
     errx(EX_CANTCREAT, "cannot write %s", out_path);
 
   RecordReader rr(fd);
+  int fd2 = -1;
+  if (in2_path && (fd2 = open(in2_path, O_RDONLY)) < 0)
+    errx(EX_NOINPUT, "cannot open %s", in2_path);
+  RecordReader rr2(fd2);
+  const int per_unit = in2_path ? 2 : 1;
   vector<IdxEnt> ents;
   uint64_t coff = 0, uoff = 0, nrec = 0;
   size_t max_rec = 0;
@@ -188,8 +201,6 @@ int main(int argc, char **argv) {
   vector<vector<unsigned char> > cblk;
   stage.reserve(BLOCKS_PER_WAVE * target + target);
 
-  const char *rec;
-  size_t rlen;
   bool more = true;
   while (more) {
     stage.clear();
@@ -199,19 +210,33 @@ int main(int argc, char **argv) {
     size_t cur_off = 0, cur_len = 0;
     uint64_t cur_rec = nrec;
 
+    // A unit is one record, or a pair of records when there are two mate
+    // files; blocks end only between units.
+    const char *urec[2];
+    size_t ulen[2];
     while (blk_off.size() < BLOCKS_PER_WAVE) {
-      more = rr.Next(&rec, &rlen);
+      more = rr.Next(&urec[0], &ulen[0]);
+      if (per_unit == 2) {
+        bool more2 = rr2.Next(&urec[1], &ulen[1]);
+        if (more != more2)
+          errx(EX_DATAERR, "the mate files have different numbers of records");
+      }
       if (! more)
         break;
-      if (rlen > max_rec)
-        max_rec = rlen;
-      if (rlen > target)
+      size_t total = 0;
+      for (int m = 0; m < per_unit; m++) {
+        if (ulen[m] > max_rec)
+          max_rec = ulen[m];
+        total += ulen[m];
+      }
+      if (total > target)
         errx(EX_DATAERR,
-             "record %llu is %zu bytes, larger than the %zu-byte block target; "
+             "record %llu is %zu bytes%s, larger than the %zu-byte block target; "
              "BGZF blocks cannot exceed 64 KB, so this file cannot be record "
              "aligned",
-             (unsigned long long) nrec, rlen, target);
-      if (cur_len > 0 && cur_len + rlen > target) {
+             (unsigned long long) nrec, total, per_unit == 2 ? " with its mate" : "",
+             target);
+      if (cur_len > 0 && cur_len + total > target) {
         blk_off.push_back(cur_off);
         blk_len.push_back(cur_len);
         blk_rec.push_back(cur_rec);
@@ -219,9 +244,10 @@ int main(int argc, char **argv) {
         cur_len = 0;
         cur_rec = nrec;
       }
-      stage.insert(stage.end(), rec, rec + rlen);
-      cur_len += rlen;
-      nrec++;
+      for (int m = 0; m < per_unit; m++)
+        stage.insert(stage.end(), urec[m], urec[m] + ulen[m]);
+      cur_len += total;
+      nrec += per_unit;
     }
     if (cur_len > 0) {
       blk_off.push_back(cur_off);
@@ -284,6 +310,8 @@ int main(int argc, char **argv) {
     errx(EX_IOERR, "closing %s failed", out_path);
   if (fd > 0)
     close(fd);
+  if (fd2 > 0)
+    close(fd2);
 
   IdxEnt sentinel;
   sentinel.coff = coff;
@@ -296,7 +324,7 @@ int main(int argc, char **argv) {
     errx(EX_CANTCREAT, "cannot write %s", idx_path);
   IdxHeader h;
   memcpy(h.magic, K2_BGZF_MAGIC, sizeof h.magic);
-  h.version = 1;
+  h.version = per_unit == 2 ? 2 : 1;
   h.block_target = (uint32_t) target;
   h.n_blocks = ents.size() - 1;
   h.n_records = nrec;

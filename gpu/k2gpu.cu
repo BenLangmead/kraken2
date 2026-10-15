@@ -27,7 +27,6 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include "../src/mmscanner.h"
 
 #define CK(x) do { cudaError_t e=(x); if (e!=cudaSuccess) { \
   fprintf(stderr,"cuda %s at %d\n",cudaGetErrorString(e),__LINE__); exit(1);} } while(0)
@@ -39,79 +38,6 @@ struct IdxHeader {
   uint64_t n_blocks, n_records, total_uncompressed;
 };
 struct IdxEnt { uint64_t coff, uoff, rec; };
-
-// Kraken 2's own scanner, over the handful of reads carrying an ambiguous
-// base.  Using it rather than reproducing its refill behaviour is the point:
-// it emits the ambiguous spans exactly, including the token-per-character it
-// produces while recovering, which is what the device version gets wrong.
-struct HostFallback {
-  k2t::Table table;
-  const uint64_t *parent, *extid; uint64_t mahv;
-  kraken2::MinimizerScanner *scanner;
-
-  bool is_anc(uint64_t a, uint64_t b) const {
-    if (!a || !b) return false;
-    while (b > a) b = parent[b];
-    return b == a;
-  }
-  uint64_t lca_h(uint64_t a, uint64_t b) const {
-    if (!a || !b) return a ? a : b;
-    while (a != b) { if (a > b) a = parent[a]; else b = parent[b]; }
-    return a;
-  }
-
-  std::string line(const char *hdr, uint32_t hlen, const char *seq, uint32_t slen) {
-    static const uint32_t AMBIG = 0xFFFFFFFDu;   // TAXID_MAX - 2, narrowed
-    std::vector<uint32_t> taxa;
-    std::map<uint32_t, uint64_t> hits;
-    scanner->LoadSequence(seq, slen);
-    uint64_t last_min = UINT64_MAX; uint32_t last_taxon = 0, *mpv;
-    uint64_t *mp;
-    (void) mpv;
-    while ((mp = scanner->NextMinimizer()) != nullptr) {
-      if (scanner->is_ambiguous()) { taxa.push_back(AMBIG); continue; }
-      uint32_t taxon;
-      if (*mp != last_min) {
-        last_min = *mp;
-        if (mahv && murmur(*mp) < mahv) { taxon = 0; last_taxon = 0; }
-        else { taxon = table.get(*mp); last_taxon = taxon; }
-      } else taxon = last_taxon;
-      if (taxon) hits[taxon]++;
-      taxa.push_back(taxon);
-    }
-    uint64_t max_taxon = 0; uint32_t max_score = 0;
-    for (auto &a : hits) {
-      uint32_t sc = 0;
-      for (auto &b : hits) if (is_anc(b.first, a.first)) sc += (uint32_t) b.second;
-      if (sc > max_score) { max_score = sc; max_taxon = a.first; }
-      else if (sc == max_score) max_taxon = lca_h(max_taxon, a.first);
-    }
-    uint64_t ext = max_taxon ? extid[max_taxon] : 0;
-
-    char buf[8192]; int n = 0;
-    n += snprintf(buf+n, sizeof buf-n, "%c\t", max_taxon ? 'C' : 'U');
-    n += snprintf(buf+n, sizeof buf-n, "%.*s\t%llu\t%u\t",
-                  (int) hlen, hdr, (unsigned long long) ext, slen);
-    if (taxa.empty()) n += snprintf(buf+n, sizeof buf-n, "0:0");
-    else {
-      uint32_t last = taxa[0]; int run = 1;
-      for (size_t i = 1; i < taxa.size(); i++) {
-        if (taxa[i] == last) { run++; continue; }
-        if (last == AMBIG) n += snprintf(buf+n, sizeof buf-n, "A:%d ", run);
-        else n += snprintf(buf+n, sizeof buf-n, "%llu:%d ",
-                           (unsigned long long) (last ? extid[last] : 0), run);
-        last = taxa[i]; run = 1;
-      }
-      // Kraken 2's last hit-list entry carries no trailing space, except in
-      // the ambiguous branch, which emits one.  Reproduced deliberately.
-      if (last == AMBIG) n += snprintf(buf+n, sizeof buf-n, "A:%d ", run);
-      else n += snprintf(buf+n, sizeof buf-n, "%llu:%d",
-                         (unsigned long long) (last ? extid[last] : 0), run);
-    }
-    n += snprintf(buf+n, sizeof buf-n, "\n");
-    return std::string(buf, n);
-  }
-};
 
 static double now_s() {
   struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -331,6 +257,9 @@ int main(int argc, char **argv) {
   }
 
   // ---- per-chunk sizing, from the index rather than guessed ----
+  // A version 2 index holds interleaved mate pairs, every block a whole
+  // number of pairs; a unit is then a pair of consecutive records.
+  int mates = ih.version == 2 ? 2 : 1;
   std::vector<size_t> chunk_b0;
   size_t max_c = 0, max_u = 0, max_r = 0, max_rec_per_blk = 0;
   for (size_t b0 = 0; b0 < ih.n_blocks; b0 += chunk_blocks) {
@@ -340,45 +269,47 @@ int main(int argc, char **argv) {
     max_u = std::max(max_u, (size_t) (ent[b1].uoff - ent[b0].uoff));
     max_r = std::max(max_r, (size_t) (ent[b1].rec  - ent[b0].rec));
   }
+  for (size_t b = 0; b <= ih.n_blocks; b++)
+    if (ent[b].rec % mates) { fprintf(stderr, "block %zu does not start at a pair\n", b); return 1; }
   auto chunk_end = [&](size_t b0) { return std::min(b0 + chunk_blocks, (size_t) ih.n_blocks); };
   size_t last_b1 = chunk_end(chunk_b0.back());
-  uint64_t n_reads = ent[last_b1].rec;
+  uint64_t n_recs = ent[last_b1].rec, n_units = n_recs / mates;
+  size_t max_units = max_r / mates;
   for (size_t b = 0; b < ih.n_blocks; b++)
     max_rec_per_blk = std::max(max_rec_per_blk, (size_t) (ent[b+1].rec - ent[b].rec));
   size_t max_ublk = 0;
   for (size_t b = 0; b < ih.n_blocks; b++)
     max_ublk = std::max(max_ublk, (size_t) (ent[b+1].uoff - ent[b].uoff));
+  printf("input: %s\n", mates == 2 ? "interleaved pairs" : "single-end reads");
 
   // A streamed run keeps every read on the device across the group loop, so
-  // the expanded input and the per-read spans are sized for the whole input;
-  // a resident run reuses one chunk's worth.
+  // the expanded input and the per-record spans are sized for the whole
+  // input; a resident run reuses one chunk's worth.
   size_t ubuf_bytes = streamed ? (size_t) ent[last_b1].uoff : max_u;
-  size_t span_reads = streamed ? (size_t) n_reads : max_r;
+  size_t span_recs = streamed ? (size_t) n_recs : max_r;
   char *h_pin;  CK(cudaHostAlloc(&h_pin, max_c, cudaHostAllocDefault));
   char *d_cbuf; CK(cudaMalloc(&d_cbuf, max_c));
   char *d_ubuf; CK(cudaMalloc(&d_ubuf, ubuf_bytes));
   uint32_t *d_off, *d_len, *d_hoff, *d_hlen;
-  CK(cudaMalloc(&d_off, span_reads*4)); CK(cudaMalloc(&d_len, span_reads*4));
-  CK(cudaMalloc(&d_hoff, span_reads*4)); CK(cudaMalloc(&d_hlen, span_reads*4));
+  CK(cudaMalloc(&d_off, span_recs*4)); CK(cudaMalloc(&d_len, span_recs*4));
+  CK(cudaMalloc(&d_hoff, span_recs*4)); CK(cudaMalloc(&d_hlen, span_recs*4));
   uint32_t *d_call, *d_llen, *d_loff, *d_sums;
-  CK(cudaMalloc(&d_call, max_r*4));
-  CK(cudaMalloc(&d_llen, max_r*4)); CK(cudaMalloc(&d_loff, max_r*4));
-  uint32_t *d_over = nullptr;
-  uint8_t *d_amb = nullptr;
-  uint32_t scan_blocks = (uint32_t) ((max_r + 255) / 256);
+  CK(cudaMalloc(&d_call, max_units*4));
+  CK(cudaMalloc(&d_llen, max_units*4)); CK(cudaMalloc(&d_loff, max_units*4));
+  uint32_t *d_over;
+  CK(cudaMalloc(&d_over, 4)); CK(cudaMemset(d_over, 0, 4));
+  uint32_t scan_blocks = (uint32_t) ((max_units + 255) / 256);
   CK(cudaMalloc(&d_sums, (scan_blocks + 1) * 4));
 
   // Lines are formatted into fixed-width slots, then packed.  The width is the
-  // worst case: an identifier, the call, the length, and one hit-list run per
-  // reported minimizer.
-  const uint32_t TEXT_STRIDE = 2048;
+  // worst case: an identifier, the call, the lengths, and one hit-list run per
+  // token of each mate.
+  const uint32_t TEXT_STRIDE = mates == 2 ? 4096 : 2048;
   char *d_text = nullptr, *d_packed = nullptr, *h_out = nullptr;
   if (out_path) {
-    CK(cudaMalloc(&d_text, (size_t) max_r * TEXT_STRIDE));
-    CK(cudaMalloc(&d_packed, (size_t) max_r * TEXT_STRIDE / 4));
-    CK(cudaHostAlloc(&h_out, (size_t) max_r * TEXT_STRIDE / 4, cudaHostAllocDefault));
-    CK(cudaMalloc(&d_over, 4)); CK(cudaMemset(d_over, 0, 4));
-    CK(cudaMalloc(&d_amb, max_r));
+    CK(cudaMalloc(&d_text, (size_t) max_units * TEXT_STRIDE));
+    CK(cudaMalloc(&d_packed, (size_t) max_units * TEXT_STRIDE / 4));
+    CK(cudaHostAlloc(&h_out, (size_t) max_units * TEXT_STRIDE / 4, cudaHostAllocDefault));
   }
   uint64_t *d_buoff, *d_brec;
   CK(cudaMalloc(&d_buoff, (chunk_blocks+1)*8));
@@ -390,7 +321,7 @@ int main(int argc, char **argv) {
   CK(cudaMalloc(&d_ac, chunk_blocks*8)); CK(cudaMalloc(&d_st, chunk_blocks*sizeof(nvcompStatus_t)));
   std::vector<void*> h_cptr(chunk_blocks), h_uptr(chunk_blocks);
   std::vector<size_t> h_cb(chunk_blocks), h_ub(chunk_blocks);
-  std::vector<uint32_t> h_call(ih.n_records);
+  std::vector<uint32_t> h_call(n_units);
 
   nvcompBatchedGzipDecompressOpts_t nopts = nvcompBatchedGzipDecompressDefaultOpts;
   cudaStream_t stream; CK(cudaStreamCreate(&stream));
@@ -401,13 +332,11 @@ int main(int argc, char **argv) {
   if (temp_bytes) CK(cudaMalloc(&d_temp, temp_bytes));
 
   size_t shmem = (4 * max_rec_per_blk + 16) * sizeof(uint32_t);
-  printf("chunk: %zu blocks, %.0f MB compressed, %.0f MB expanded, %zu reads; "
+  printf("chunk: %zu blocks, %.0f MB compressed, %.0f MB expanded, %zu records; "
          "parse shared %.1f KB\n", chunk_blocks, max_c/1e6, max_u/1e6, max_r, shmem/1024.0);
 
   int out_fd = -1;
-  size_t out_bytes = 0, n_fallback = 0;
-  kraken2::MinimizerScanner fb_scanner(k, l, ssm, true, tog, (int) o[6]);
-  HostFallback fb_ctx{h_tab, h_par.data(), h_ext.data(), mahv, &fb_scanner};
+  size_t out_bytes = 0;
   if (out_path) {
     out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) { fprintf(stderr, "cannot write %s\n", out_path); return 1; }
@@ -433,10 +362,11 @@ int main(int argc, char **argv) {
                    {"pack + copy out"}};
   for (auto &t : tm) { CK(cudaEventCreate(&t.a)); CK(cudaEventCreate(&t.b)); t.ms = 0; t.pending = false; }
   auto collect_all = [&]() { for (auto &t : tm) t.collect(); };
-  double t_read = 0, t_write = 0, t_fallback = 0;
+  double t_read = 0, t_write = 0;
 
   // Reads chunk [b0, b1) from disk, expands it into ubuf and splits it into
-  // reads; the spans are written at off.. (indexed from the chunk's first read).
+  // records; the spans are written at off.. (indexed from the chunk's first
+  // record).
   auto load_chunk = [&](size_t b0, char *ubuf, uint32_t *off, uint32_t *len,
                         uint32_t *hoff, uint32_t *hlen) {
     size_t b1 = chunk_end(b0), nb = b1 - b0;
@@ -513,33 +443,31 @@ int main(int argc, char **argv) {
 
   // Classifies (CLASSIFY) or finishes (FINISH) one loaded chunk, writes its
   // lines, and keeps its calls for the check against classify.
-  uint64_t done_reads = 0;
+  uint64_t done_units = 0;
   auto emit_chunk = [&](size_t b0, const char *ubuf, const uint32_t *off, const uint32_t *len,
                         const uint32_t *hoff, const uint32_t *hlen, StreamArgs sa) {
-    size_t nrec = ent[chunk_end(b0)].rec - ent[b0].rec;
-    if (out_path) CK(cudaMemsetAsync(d_amb, 0, nrec, stream));
+    size_t nu = (ent[chunk_end(b0)].rec - ent[b0].rec) / mates;
     tm[T_CLASSIFY].start(stream);
     fused<<<8192, THREADS, 0, stream>>>(
-        ubuf, off, len, (uint32_t) nrec, k, l, ssm, tog, mahv,
-        d_tab, skip_probe, sa,
-        nullptr, nullptr, nullptr, nullptr, d_parent, d_extid, d_call,
-        hoff, hlen, d_text, TEXT_STRIDE, d_llen, d_over, d_amb);
+        ubuf, off, len, (uint32_t) nu, mates, k, l, ssm, tog, mahv,
+        d_tab, skip_probe, sa, d_parent, d_extid, d_call,
+        hoff, hlen, d_text, TEXT_STRIDE, d_llen, d_over);
     tm[T_CLASSIFY].stop(stream);
 
     if (out_path) {
       tm[T_OUTPUT].start(stream);
-      uint32_t nblk = (uint32_t) ((nrec + 255) / 256);
-      scan_pass1<<<nblk, 256, 0, stream>>>(d_llen, d_loff, d_sums, (uint32_t) nrec);
+      uint32_t nblk = (uint32_t) ((nu + 255) / 256);
+      scan_pass1<<<nblk, 256, 0, stream>>>(d_llen, d_loff, d_sums, (uint32_t) nu);
       scan_pass2<<<1, 1, 0, stream>>>(d_sums, nblk);
-      scan_pass3<<<nblk, 256, 0, stream>>>(d_loff, d_sums, (uint32_t) nrec);
+      scan_pass3<<<nblk, 256, 0, stream>>>(d_loff, d_sums, (uint32_t) nu);
       compact_text<<<8192, 128, 0, stream>>>(d_text, TEXT_STRIDE, d_llen, d_loff,
-                                             d_packed, (uint32_t) nrec);
+                                             d_packed, (uint32_t) nu);
       uint32_t last_off, last_len;
-      CK(cudaMemcpyAsync(&last_off, d_loff + nrec - 1, 4, cudaMemcpyDeviceToHost, stream));
-      CK(cudaMemcpyAsync(&last_len, d_llen + nrec - 1, 4, cudaMemcpyDeviceToHost, stream));
+      CK(cudaMemcpyAsync(&last_off, d_loff + nu - 1, 4, cudaMemcpyDeviceToHost, stream));
+      CK(cudaMemcpyAsync(&last_len, d_llen + nu - 1, 4, cudaMemcpyDeviceToHost, stream));
       CK(cudaStreamSynchronize(stream));
       size_t tbytes = (size_t) last_off + last_len;
-      size_t cap = (size_t) max_r * TEXT_STRIDE / 4;
+      size_t cap = (size_t) max_units * TEXT_STRIDE / 4;
       if (tbytes > cap) {
         fprintf(stderr, "packed output %zu bytes exceeds the %zu reserved\n", tbytes, cap);
         exit(1);
@@ -548,43 +476,14 @@ int main(int argc, char **argv) {
       tm[T_OUTPUT].stop(stream);
       CK(cudaStreamSynchronize(stream));
       double tw = now_s();
-      // Reads the kernel declined contribute no bytes, so their line belongs
-      // exactly at their offset.  Splice the host's version in there.
-      std::vector<uint8_t> amb(nrec);
-      CK(cudaMemcpy(amb.data(), d_amb, nrec, cudaMemcpyDeviceToHost));
-      std::vector<uint32_t> fb;
-      for (size_t i = 0; i < nrec; i++) if (amb[i]) fb.push_back((uint32_t) i);
-      if (fb.empty()) emit(h_out, tbytes);
-      else {
-        std::vector<uint32_t> loff(nrec), soff(nrec), slen(nrec), ho(nrec), hl(nrec);
-        CK(cudaMemcpy(loff.data(), d_loff, nrec*4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(soff.data(), off,  nrec*4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(slen.data(), len,  nrec*4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(ho.data(), hoff, nrec*4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(hl.data(), hlen, nrec*4, cudaMemcpyDeviceToHost));
-        size_t pos = 0;
-        std::vector<char> rb;
-        for (uint32_t r : fb) {
-          emit(h_out + pos, loff[r] - pos);
-          pos = loff[r];
-          double tfb = now_s();
-          rb.resize(hl[r] + slen[r]);
-          CK(cudaMemcpy(rb.data(), ubuf + ho[r], hl[r], cudaMemcpyDeviceToHost));
-          CK(cudaMemcpy(rb.data() + hl[r], ubuf + soff[r], slen[r], cudaMemcpyDeviceToHost));
-          std::string ln = fb_ctx.line(rb.data(), hl[r], rb.data() + hl[r], slen[r]);
-          t_fallback += now_s() - tfb;
-          emit(ln.data(), ln.size());
-          n_fallback++;
-        }
-        emit(h_out + pos, tbytes - pos);
-      }
+      emit(h_out, tbytes);
       t_write += now_s() - tw;
     }
-    CK(cudaMemcpyAsync(h_call.data() + done_reads, d_call, nrec*4,
+    CK(cudaMemcpyAsync(h_call.data() + done_units, d_call, nu*4,
                        cudaMemcpyDeviceToHost, stream));
     CK(cudaStreamSynchronize(stream));
     collect_all();
-    done_reads += nrec;
+    done_units += nu;
   };
 
   // ---- the pipeline ----
@@ -593,8 +492,8 @@ int main(int argc, char **argv) {
   double t_in = 0, t_bin = 0, t_groups = 0, t_fin = 0;
   double copy_ms = 0, probe_ms = 0;
   size_t copy_bytes = 0;
-  uint32_t tok_stride = 0;
-  double lookups_per_read = 0;
+  uint32_t mate_stride = 0, tok_stride = 0;
+  double lookups_per_unit = 0;
 
   if (! streamed) {
     for (size_t b0 : chunk_b0) {
@@ -608,46 +507,61 @@ int main(int argc, char **argv) {
       load_chunk(b0, d_ubuf + ent[b0].uoff, d_off + r0, d_len + r0, d_hoff + r0, d_hlen + r0);
     }
     uint32_t *d_max; CK(cudaMalloc(&d_max, 4)); CK(cudaMemset(d_max, 0, 4));
-    max_len<<<1024, 256, 0, stream>>>(d_len, (uint32_t) n_reads, d_max);
+    max_len<<<1024, 256, 0, stream>>>(d_len, (uint32_t) n_recs, d_max);
     uint32_t mlen; CK(cudaMemcpy(&mlen, d_max, 4, cudaMemcpyDeviceToHost));
     if (mlen > (uint32_t) MAX_LEN) mlen = MAX_LEN;
-    tok_stride = mlen >= (uint32_t) k ? mlen - k + 1 : 1;
-    if ((double) n_reads * tok_stride >= 4294967296.0) {
+    // A mate yields at most len - k + 1 tokens, with or without ambiguous
+    // bases.
+    mate_stride = mlen >= (uint32_t) k ? mlen - k + 1 : 1;
+    tok_stride = mate_stride * mates;
+    if ((double) n_units * tok_stride >= 4294967296.0) {
       fprintf(stderr, "too many k-mers for 32-bit token indices; use fewer chunks\n"); return 1;
     }
-    // The state that survives the group loop: one taxon per k-mer position.
-    uint16_t *d_tok;
-    CK(cudaMalloc(&d_tok, (size_t) n_reads * tok_stride * 2));
+    // The state that survives the group loop, one entry per token: a taxon
+    // when each group rescans, a bin entry index when the scan bins.
+    uint16_t *d_tok = nullptr; uint32_t *d_ref = nullptr;
+    if (binned) CK(cudaMalloc(&d_ref, (size_t) n_units * tok_stride * 4));
+    else CK(cudaMalloc(&d_tok, (size_t) n_units * tok_stride * 2));
     t_in = now_s() - t0;
 
     // Binned variant: the scan runs once and files each lookup under its
-    // partition, one set of bins per chunk.  A bin holds up to bin_cap
-    // entries; the cap assumes at most bin_frac lookups per k-mer position
-    // and the run stops if any bin overflows.
-    std::vector<uint64_t *> bh(chunk_b0.size(), nullptr);
-    std::vector<uint32_t *> bi(chunk_b0.size(), nullptr), bc(chunk_b0.size(), nullptr);
+    // partition, one set of bins per chunk, all in one array.  A bin holds up
+    // to bin_cap entries; the cap assumes at most bin_frac lookups per token
+    // position and the run stops if any bin overflows.
+    uint32_t P = (uint32_t) d_tab.G.P;
+    std::vector<uint64_t> bbase(chunk_b0.size() + 1, 0);
     std::vector<uint32_t> bcap(chunk_b0.size(), 0);
+    uint64_t *d_bh = nullptr; uint16_t *d_bv = nullptr; uint32_t *d_bc = nullptr;
     if (binned) {
       double tb = now_s();
-      uint64_t total = 0;
-      uint32_t P = (uint32_t) d_tab.G.P;
       for (size_t c = 0; c < chunk_b0.size(); c++) {
         size_t b0 = chunk_b0[c];
-        uint64_t r0 = ent[b0].rec, nrec = ent[chunk_end(b0)].rec - r0;
-        double mean = (double) nrec * tok_stride * bin_frac / P;
+        uint64_t nu = (ent[chunk_end(b0)].rec - ent[b0].rec) / mates;
+        double mean = (double) nu * tok_stride * bin_frac / P;
         bcap[c] = (uint32_t) (mean + 8 * sqrt(mean) + 1024);
-        CK(cudaMalloc(&bh[c], (size_t) P * bcap[c] * 8));
-        CK(cudaMalloc(&bi[c], (size_t) P * bcap[c] * 4));
-        CK(cudaMalloc(&bc[c], P * 4)); CK(cudaMemset(bc[c], 0, P * 4));
-        StreamArgs sa{BIN, d_tok, r0 * tok_stride, tok_stride, 0, 0, bh[c], bi[c], bc[c], bcap[c]};
+        bbase[c + 1] = bbase[c] + (uint64_t) P * bcap[c];
+      }
+      if (bbase.back() >= 4294967296ULL) {
+        fprintf(stderr, "bins exceed 32-bit entry indices; use fewer chunks\n"); return 1;
+      }
+      CK(cudaMalloc(&d_bh, bbase.back() * 8));
+      CK(cudaMalloc(&d_bv, bbase.back() * 2));
+      CK(cudaMalloc(&d_bc, chunk_b0.size() * P * 4));
+      CK(cudaMemset(d_bc, 0, chunk_b0.size() * P * 4));
+      uint64_t total = 0;
+      for (size_t c = 0; c < chunk_b0.size(); c++) {
+        size_t b0 = chunk_b0[c];
+        uint64_t r0 = ent[b0].rec, nu = (ent[chunk_end(b0)].rec - r0) / mates;
+        StreamArgs sa{BIN, nullptr, d_ref, (r0 / mates) * tok_stride, tok_stride, mate_stride,
+                      0, 0, d_bh, d_bv, d_bc + c * P, bcap[c], bbase[c]};
         tm[T_BIN].start(stream);
         fused<<<8192, THREADS, 0, stream>>>(
-            d_ubuf + ent[b0].uoff, d_off + r0, d_len + r0, (uint32_t) nrec, k, l, ssm, tog, mahv,
-            d_tab, 0, sa, nullptr, nullptr, nullptr, nullptr, d_parent, d_extid, d_call,
-            nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr);
+            d_ubuf + ent[b0].uoff, d_off + r0, d_len + r0, (uint32_t) nu, mates, k, l, ssm, tog, mahv,
+            d_tab, 0, sa, d_parent, d_extid, d_call,
+            nullptr, nullptr, nullptr, 0, nullptr, nullptr);
         tm[T_BIN].stop(stream);
         std::vector<uint32_t> cnt(P);
-        CK(cudaMemcpyAsync(cnt.data(), bc[c], P * 4, cudaMemcpyDeviceToHost, stream));
+        CK(cudaMemcpyAsync(cnt.data(), d_bc + c * P, P * 4, cudaMemcpyDeviceToHost, stream));
         CK(cudaStreamSynchronize(stream));
         collect_all();
         for (uint32_t b = 0; b < P; b++) {
@@ -659,7 +573,7 @@ int main(int argc, char **argv) {
           total += cnt[b];
         }
       }
-      lookups_per_read = (double) total / n_reads;
+      lookups_per_unit = (double) total / n_units;
       t_bin = now_s() - tb;
     }
 
@@ -669,7 +583,7 @@ int main(int argc, char **argv) {
     // that read it are done.  With K2GPU_SERIAL the copy runs on the compute
     // stream instead, so nothing overlaps.
     double tg = now_s();
-    uint32_t P = (uint32_t) d_tab.G.P, per = P / n_groups;
+    uint32_t per = P / n_groups;
     size_t group_bytes = (size_t) per * d_tab.G.nb * 64;
     cudaStream_t cs = stream;
     if (! serial) CK(cudaStreamCreate(&cs));
@@ -696,19 +610,19 @@ int main(int argc, char **argv) {
       CK(cudaEventRecord(p0[g], stream));
       for (size_t c = 0; c < chunk_b0.size(); c++) {
         size_t b0 = chunk_b0[c];
-        uint64_t r0 = ent[b0].rec, nrec = ent[chunk_end(b0)].rec - r0;
+        uint64_t r0 = ent[b0].rec, nu = (ent[chunk_end(b0)].rec - r0) / mates;
         if (binned) {
           uint64_t n = (uint64_t) per * bcap[c];
           unsigned blocks = (unsigned) std::min<uint64_t>((n + 255) / 256, 1u << 20);
-          probe_bins<<<blocks, 256, 0, stream>>>(gt, bh[c], bi[c], bc[c], bcap[c],
-                                                 g * per, (g + 1) * per, d_tok, bin_nowrite);
+          probe_bins<<<blocks, 256, 0, stream>>>(gt, d_bh, d_bv, d_bc + c * P, bcap[c], bbase[c],
+                                                 g * per, (g + 1) * per, bin_nowrite);
         } else {
-          StreamArgs sa{PROBE_GROUP, d_tok, r0 * tok_stride, tok_stride, g * per, (g + 1) * per,
-                        nullptr, nullptr, nullptr, 0};
+          StreamArgs sa{PROBE_GROUP, d_tok, nullptr, (r0 / mates) * tok_stride, tok_stride,
+                        mate_stride, g * per, (g + 1) * per, nullptr, nullptr, nullptr, 0, 0};
           fused<<<8192, THREADS, 0, stream>>>(
-              d_ubuf + ent[b0].uoff, d_off + r0, d_len + r0, (uint32_t) nrec, k, l, ssm, tog, mahv,
-              gt, 0, sa, nullptr, nullptr, nullptr, nullptr, d_parent, d_extid, d_call,
-              nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr);
+              d_ubuf + ent[b0].uoff, d_off + r0, d_len + r0, (uint32_t) nu, mates, k, l, ssm, tog, mahv,
+              gt, 0, sa, d_parent, d_extid, d_call,
+              nullptr, nullptr, nullptr, 0, nullptr, nullptr);
         }
       }
       CK(cudaEventRecord(p1[g], stream));
@@ -726,7 +640,8 @@ int main(int argc, char **argv) {
     double tf = now_s();
     for (size_t b0 : chunk_b0) {
       uint64_t r0 = ent[b0].rec;
-      StreamArgs sa{FINISH, d_tok, r0 * tok_stride, tok_stride, 0, 0, nullptr, nullptr, nullptr, 0};
+      StreamArgs sa{FINISH, d_tok, d_ref, (r0 / mates) * tok_stride, tok_stride, mate_stride,
+                    0, 0, nullptr, d_bv, nullptr, 0, 0};
       emit_chunk(b0, d_ubuf + ent[b0].uoff, d_off + r0, d_len + r0, d_hoff + r0, d_hlen + r0, sa);
     }
     t_fin = now_s() - tf;
@@ -734,44 +649,46 @@ int main(int argc, char **argv) {
   double el = now_s() - t0;
 
   if (out_fd >= 0) { close(out_fd); }
-  printf("\nend to end   %.3f s   %.2f Gbase/s   %.1f Mread/s   %.2f Mread total\n",
-         el, ih.total_uncompressed * 0.4 / el / 1e9, done_reads / el / 1e6,
-         done_reads / 1e6);
-  printf("             (bases are about 40%% of the FASTQ bytes)\n");
+  printf("\nend to end   %.3f s   %.2f Gbase/s   %.1f Munit/s   %.2f Munit total\n",
+         el, ih.total_uncompressed * 0.4 / el / 1e9, done_units / el / 1e6,
+         done_units / 1e6);
+  printf("             (bases are about 40%% of the FASTQ bytes; a unit is a %s)\n",
+         mates == 2 ? "pair" : "read");
   printf("stage times (s):\n  %-40s %8.3f\n", "read input (host)", t_read);
   for (int i = 0; i < N_T; i++)
     if (tm[i].ms > 0) printf("  %-40s %8.3f\n", tm[i].name, tm[i].ms / 1e3);
-  printf("  %-40s %8.3f\n", "write output + fallback (host)", t_write);
-  printf("  %-40s %8.3f\n", "  of which fallback reads (host)", t_fallback);
+  printf("  %-40s %8.3f\n", "write output (host)", t_write);
   if (streamed) {
     printf("streamed: %u groups of %u partitions (%.3f GB each), %s%s\n", n_groups,
            (uint32_t) d_tab.G.P / n_groups, table_bytes / 1e9 / n_groups,
            binned ? "binned" : "recomputed", serial ? ", serial" : ", overlapped");
     printf("  %-40s %8.3f\n", "load all chunks (wall)", t_in);
-    if (binned) printf("  %-40s %8.3f   (%.1f lookups per read)\n", "bin (wall)", t_bin, lookups_per_read);
+    if (binned) printf("  %-40s %8.3f   (%.1f lookups per unit)\n", "bin (wall)", t_bin, lookups_per_unit);
     printf("  %-40s %8.3f\n", "group loop (wall)", t_groups);
     printf("  %-40s %8.3f   (%.2f GB, %.1f GB/s)\n", "  table copies (sum)", copy_ms / 1e3,
            copy_bytes / 1e9, copy_bytes / 1e9 / (copy_ms / 1e3));
     printf("  %-40s %8.3f\n", "  probes (sum)", probe_ms / 1e3);
     printf("  %-40s %8.3f\n", "finish (wall)", t_fin);
-    printf("per-read state: %u bytes of k-mer taxa", tok_stride * 2);
-    if (binned) printf(" + %.0f bytes of binned minimizers", lookups_per_read * 12);
-    printf("\n");
+    if (binned)
+      printf("per-unit state: %u bytes of token references + %.0f bytes of binned "
+             "minimizers and results\n", tok_stride * 4, lookups_per_unit * 10);
+    else
+      printf("per-unit state: %u bytes of token taxa\n", tok_stride * 2);
   }
-  if (out_bytes) {
+  {
     uint32_t over = 0;
     CK(cudaMemcpy(&over, d_over, 4, cudaMemcpyDeviceToHost));
-    printf("             wrote %.2f GB of output, %u truncated, "
-           "%zu reads via the host fallback\n", out_bytes / 1e9, over, n_fallback);
-    if (over) { fprintf(stderr, "some hit lists did not fit the slot\n"); return 1; }
+    if (out_bytes)
+      printf("             wrote %.2f GB of output, %u truncated or too long\n", out_bytes / 1e9, over);
+    if (over) { fprintf(stderr, "some reads were too long or hit lists did not fit the slot\n"); return 1; }
   }
 
   // ---- correctness, against classify's own calls ----
   FILE *rf = fopen(argv[6], "rb");
   if (!rf) { fprintf(stderr, "cannot open %s\n", argv[6]); return 1; }
   size_t bad = 0, seen = 0, classified = 0;
-  char line[8192];
-  for (uint64_t i = 0; i < done_reads && fgets(line, sizeof line, rf); i++) {
+  char line[16384];
+  for (uint64_t i = 0; i < done_units && fgets(line, sizeof line, rf); i++) {
     unsigned long want = 0;
     char *p1 = strchr(line, '\t');
     char *p2 = p1 ? strchr(p1 + 1, '\t') : nullptr;
@@ -779,7 +696,7 @@ int main(int argc, char **argv) {
     seen++;
     if (want) classified++;
     if ((unsigned long) h_call[i] != want) {
-      if (bad < 3) fprintf(stderr, "read %" PRIu64 ": classify %lu, gpu %u\n", i, want, h_call[i]);
+      if (bad < 3) fprintf(stderr, "unit %" PRIu64 ": classify %lu, gpu %u\n", i, want, h_call[i]);
       bad++;
     }
   }
