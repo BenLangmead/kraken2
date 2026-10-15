@@ -42,9 +42,16 @@
 // lookup searches only when alt is full.  Augmenting placement at build time
 // normally leaves the stash empty.
 //
-// File layout: a BlockedTableHeader padded to 4096 bytes, P * nb buckets,
-// then the stash: P + 1 uint64 offsets, the stash keys (home << r | rem,
-// uint64) and their taxa (uint32).
+// Subsampling keeps only partitions 0 .. K-1, a fraction K / P of hash space,
+// and stores each one exactly as a full build would: nb comes from the
+// full key count, so a kept partition is byte-identical to the same
+// partition of the full table.  A lookup whose partition is K or above is a
+// miss and reads a shared all-empty bucket instead of the table.
+//
+// File layout: a BlockedTableHeader padded to 4096 bytes, K * nb buckets,
+// then the stash: K + 1 uint64 offsets, the stash keys (home << r | rem,
+// uint64) and their taxa (uint32).  K is kept_partitions, or P when that
+// field is 0.
 
 #ifndef KRAKEN2_BLOCKED_TABLE_H_
 #define KRAKEN2_BLOCKED_TABLE_H_
@@ -85,6 +92,7 @@ struct BlockedTableHeader {
   uint64_t pext_mask;
   uint64_t guests;
   uint64_t spilled_buckets;
+  uint64_t kept_partitions;     // K; 0 means all P partitions
 };
 
 namespace blocked {
@@ -179,14 +187,14 @@ const uint64_t SPILL_SALT = 0x2545f4914f6cdd1dULL;
 // Index math shared by the build and the lookup.
 struct Geometry {
   int p, q, B, r, v, w, S, sf, H;
-  uint64_t P, nb, qmask, rmask, vmask;
+  uint64_t P, K, nb, qmask, rmask, vmask;
   Pext pext;
   Mix mix;
   FastDiv fd_nb;
   FastMod fm_alt, fm_sf;
 
   void init(uint64_t pext_mask, int partition_bits, uint64_t buckets,
-            int remainder_bits, int value_bits);
+            int remainder_bits, int value_bits, uint64_t kept_partitions = 0);
   inline uint64_t hash(uint64_t minimizer) const { return mix(pext(minimizer)); }
   // home and rem of the low q bits of a hash.
   inline void locate(uint64_t h, uint64_t &part, uint64_t &home, uint64_t &rem) const {
@@ -235,6 +243,7 @@ class BlockedTable : public KeyValueStore {
   const uint64_t *stash_offsets_;
   const uint64_t *stash_keys_;
   const uint32_t *stash_vals_;
+  uint8_t empty_bucket_[64] __attribute__((aligned(64)));
   char *owned_;            // malloc'ed table bytes, or nullptr when mapped
   size_t owned_bytes_;
   MMapFile backing_file_;
@@ -252,7 +261,8 @@ class BlockedTable : public KeyValueStore {
 // LCA, and writes the table.  Pairs are grouped by partition as they arrive,
 // so each partition is placed independently.  remainder_bits of 0 builds an
 // exact table; a positive value is used as r, which gives a fingerprint table
-// when it is below the exact width.
+// when it is below the exact width.  kept_partitions of 0 keeps every
+// partition; K keeps partitions 0 .. K-1 and drops the rest.
 class BlockedTableBuilder {
   public:
 #pragma pack(push, 1)
@@ -260,7 +270,8 @@ class BlockedTableBuilder {
 #pragma pack(pop)
 
   BlockedTableBuilder(uint64_t pext_mask, int partition_bits, double load,
-                      const Taxonomy &tax, int remainder_bits = 0);
+                      const Taxonomy &tax, int remainder_bits = 0,
+                      uint64_t kept_partitions = 0);
 
   // Per-thread buffer; Add() is not thread-safe, Flush() is.
   class Buffer {
@@ -288,6 +299,7 @@ class BlockedTableBuilder {
   int p_, B_;
   double load_;
   int remainder_bits_;
+  uint64_t kept_;
   const Taxonomy &tax_;
   blocked::Pext pext_;
   blocked::Mix mix_;

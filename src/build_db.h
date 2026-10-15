@@ -33,6 +33,7 @@ struct Options {
   int blocked_partition_bits;
   double blocked_load;
   int blocked_remainder_bits;  // 0 means exact
+  uint64_t blocked_kept_partitions;  // 0 means all
 };
 
 vector<string> ExtractNCBISequenceIDs(const string &header);
