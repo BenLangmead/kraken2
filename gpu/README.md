@@ -11,7 +11,8 @@ agree with it, and each records a measurement taken on an L40S (`g6e`, us-east-1
 | `fused.cu` | scan, subsample and probe together, real 16 GB table | logic verified via `emul.cc`; not yet run on a device |
 | `emul.cc` | host emulation of `fused.cu`, minus the CUDA parts | exact on 50,000 reads / 262,335 lookups |
 | `kernels.cuh` | the device kernels, shared so the two programs cannot drift | &mdash; |
-| `k2gpu.cu` | end to end: BGZF in, one call per read out | first end-to-end run |
+| `table.h` | the table as host and device see it: compact hash or blocked, chosen by magic number | shared by the kernels, the host fallback and `emul.cc` |
+| `k2gpu.cu` | end to end: BGZF in, one call per read out; can stream a blocked table in groups of partitions | byte-identical to classify with either table, resident or streamed (10M reads, L40S) |
 
 `emul.cc` exists because device time is the scarce resource.  Running the
 kernel's logic on the host first caught two defects that would otherwise have
@@ -27,7 +28,8 @@ The oracle both are checked against comes from `src/k2mindump.cc`.
     nvcc -O3 -std=c++14 -arch=sm_89 -o fused fused.cu
     g++  -O3 -std=c++11 -o emul emul.cc
 
-`gpu_inflate.cc` additionally needs nvCOMP:
+`gpu_inflate.cc` and `k2gpu.cu` additionally need nvCOMP.  Use 5.3 or later:
+5.0.0.6 reads outside its output buffer when inflating these BGZF blocks.
 
     g++ -O3 -std=c++14 -I<nvcomp>/include -L<nvcomp>/lib64 -lnvcomp -lcudart \
         -o gpu_inflate gpu_inflate.cc
