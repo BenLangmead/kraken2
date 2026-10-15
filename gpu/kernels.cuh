@@ -342,14 +342,17 @@ __global__ void probe_bins(const k2t::Table table,
                            const uint32_t *__restrict__ bin_i,
                            const uint32_t *__restrict__ bin_cnt, uint32_t bin_cap,
                            uint32_t part_lo, uint32_t part_hi,
-                           uint16_t *__restrict__ tok_tax) {
+                           uint16_t *__restrict__ tok_tax, int no_write) {
   uint64_t n = (uint64_t) (part_hi - part_lo) * bin_cap;
   for (uint64_t j = blockIdx.x * (uint64_t) blockDim.x + threadIdx.x; j < n;
        j += (uint64_t) gridDim.x * blockDim.x) {
     uint32_t b = part_lo + (uint32_t) (j / bin_cap), e = (uint32_t) (j % bin_cap);
     if (e >= bin_cnt[b]) continue;
     uint64_t at = (uint64_t) b * bin_cap + e;
-    tok_tax[bin_i[at]] = (uint16_t) table.get_blocked_hash(bin_h[at]);
+    uint32_t v = table.get_blocked_hash(bin_h[at]);
+    // A taxon never equals 0xFFFF0000, so with no_write nothing is stored,
+    // but the lookup cannot be optimized away.
+    if (!no_write || v == 0xFFFF0000u) tok_tax[bin_i[at]] = (uint16_t) v;
   }
 }
 

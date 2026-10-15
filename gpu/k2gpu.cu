@@ -146,6 +146,9 @@ int main(int argc, char **argv) {
   bool binned = env_int("K2GPU_BIN", 0) != 0;
   bool serial = env_int("K2GPU_SERIAL", 0) != 0;
   double bin_frac = getenv("K2GPU_BIN_FRAC") ? atof(getenv("K2GPU_BIN_FRAC")) : 0.5;
+  // K2GPU_BIN_NOWRITE=1 keeps the binned lookups but not the scattered
+  // stores of their results, to separate the two costs.  Output is wrong.
+  int bin_nowrite = env_int("K2GPU_BIN_NOWRITE", 0);
 
   // ---- index ----
   IdxHeader ih;
@@ -430,7 +433,7 @@ int main(int argc, char **argv) {
                    {"pack + copy out"}};
   for (auto &t : tm) { CK(cudaEventCreate(&t.a)); CK(cudaEventCreate(&t.b)); t.ms = 0; t.pending = false; }
   auto collect_all = [&]() { for (auto &t : tm) t.collect(); };
-  double t_read = 0, t_write = 0;
+  double t_read = 0, t_write = 0, t_fallback = 0;
 
   // Reads chunk [b0, b1) from disk, expands it into ubuf and splits it into
   // reads; the spans are written at off.. (indexed from the chunk's first read).
@@ -564,10 +567,12 @@ int main(int argc, char **argv) {
         for (uint32_t r : fb) {
           emit(h_out + pos, loff[r] - pos);
           pos = loff[r];
+          double tfb = now_s();
           rb.resize(hl[r] + slen[r]);
           CK(cudaMemcpy(rb.data(), ubuf + ho[r], hl[r], cudaMemcpyDeviceToHost));
           CK(cudaMemcpy(rb.data() + hl[r], ubuf + soff[r], slen[r], cudaMemcpyDeviceToHost));
           std::string ln = fb_ctx.line(rb.data(), hl[r], rb.data() + hl[r], slen[r]);
+          t_fallback += now_s() - tfb;
           emit(ln.data(), ln.size());
           n_fallback++;
         }
@@ -696,7 +701,7 @@ int main(int argc, char **argv) {
           uint64_t n = (uint64_t) per * bcap[c];
           unsigned blocks = (unsigned) std::min<uint64_t>((n + 255) / 256, 1u << 20);
           probe_bins<<<blocks, 256, 0, stream>>>(gt, bh[c], bi[c], bc[c], bcap[c],
-                                                 g * per, (g + 1) * per, d_tok);
+                                                 g * per, (g + 1) * per, d_tok, bin_nowrite);
         } else {
           StreamArgs sa{PROBE_GROUP, d_tok, r0 * tok_stride, tok_stride, g * per, (g + 1) * per,
                         nullptr, nullptr, nullptr, 0};
@@ -737,6 +742,7 @@ int main(int argc, char **argv) {
   for (int i = 0; i < N_T; i++)
     if (tm[i].ms > 0) printf("  %-40s %8.3f\n", tm[i].name, tm[i].ms / 1e3);
   printf("  %-40s %8.3f\n", "write output + fallback (host)", t_write);
+  printf("  %-40s %8.3f\n", "  of which fallback reads (host)", t_fallback);
   if (streamed) {
     printf("streamed: %u groups of %u partitions (%.3f GB each), %s%s\n", n_groups,
            (uint32_t) d_tab.G.P / n_groups, table_bytes / 1e9 / n_groups,
