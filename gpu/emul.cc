@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include "table.h"
 
 static const int MAX_LEN = 320;
 
@@ -70,22 +71,6 @@ static uint32_t resolve(const uint64_t *parent, const uint32_t *tax,
   return (uint32_t) max_taxon;
 }
 
-static inline uint32_t probe(const uint32_t *t, uint64_t cap, uint64_t key,
-                             int key_bits, int value_bits) {
-  uint64_t hc = murmur(key);
-  uint32_t compacted = (uint32_t) (hc >> (64 - key_bits));
-  uint64_t idx = hc % cap, first = idx;
-  const uint32_t vmask = (1u << value_bits) - 1;
-  while (true) {
-    uint32_t cell = t[idx];
-    uint32_t val = cell & vmask;
-    if (!val) return 0;
-    if ((cell >> value_bits) == compacted) return val;
-    if (++idx == cap) idx = 0;
-    if (idx == first) return 0;
-  }
-}
-
 int main(int argc, char **argv) {
   if (argc < 6) {
     fprintf(stderr, "usage: emul reads.fq hash.k2d opts.k2d taxo.k2d oracle [reads]\n"
@@ -106,12 +91,30 @@ int main(int argc, char **argv) {
   struct stat st; fstat(hf, &st);
   char *map = (char *) mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, hf, 0);
   if (map == MAP_FAILED) { perror("mmap"); return 1; }
-  uint64_t cap, sz, key_bits, value_bits;
-  memcpy(&cap, map, 8); memcpy(&sz, map+8, 8);
-  memcpy(&key_bits, map+16, 8); memcpy(&value_bits, map+24, 8);
-  const uint32_t *table = (const uint32_t *) (map + 32);
-  printf("k=%d l=%d capacity=%" PRIu64 " key_bits=%" PRIu64 " value_bits=%" PRIu64 "\n",
-         k, l, cap, key_bits, value_bits);
+  // Either table, chosen by magic number, through the same k2t::Table code
+  // the kernel uses.
+  k2t::Table table{};
+  uint64_t tmagic; memcpy(&tmagic, map, 8);
+  if (tmagic == k2t::BLOCKED_MAGIC) {
+    k2t::BlockedHeader bh; memcpy(&bh, map, sizeof bh);
+    table.kind = k2t::Table::BLOCKED;
+    table.G.init(bh);
+    size_t nbk = (size_t) (table.G.P * table.G.nb) * 64;
+    size_t off_o = k2t::BLOCKED_HEADER_BYTES + nbk, off_k = off_o + (table.G.P + 1) * 8;
+    table.buckets = (const uint8_t *) (map + k2t::BLOCKED_HEADER_BYTES);
+    table.stash_off = (const uint64_t *) (map + off_o);
+    table.stash_key = (const uint64_t *) (map + off_k);
+    table.stash_val = (const uint32_t *) (map + off_k + bh.stash_entries * 8);
+    printf("k=%d l=%d blocked: %" PRIu64 " partitions of %" PRIu64 " buckets, r=%d v=%d\n",
+           k, l, table.G.P, table.G.nb, table.G.r, table.G.v);
+  } else {
+    uint64_t hdr[4]; memcpy(hdr, map, sizeof hdr);
+    table.kind = k2t::Table::CHT;
+    table.capacity = hdr[0]; table.key_bits = (int) hdr[2]; table.value_bits = (int) hdr[3];
+    table.cells = (const uint32_t *) (map + 32);
+    printf("k=%d l=%d compact hash: capacity=%" PRIu64 " key_bits=%d value_bits=%d\n",
+           k, l, table.capacity, table.key_bits, table.value_bits);
+  }
 
   // Taxonomy: only the parent and external-id columns are needed.
   int tf = open(argv[4], O_RDONLY);
@@ -201,24 +204,16 @@ int main(int argc, char **argv) {
 
     int n_kmer = (int) L - k + 1; if (n_kmer < 1) n_kmer = 0;
     int win = k - l + 1;
+    // One token per k-mer whose window holds k - l + 1 unambiguous l-mers.
     for (int p = 0; p < n_kmer; p++) {
-      int arg = -1; uint64_t m = ~0ULL; bool ok = true;
+      uint64_t m = ~0ULL; bool ok = true;
       for (int j = 0; j < win; j++) {
         uint64_t c = cand[p+j];
         if (c == ~0ULL) { ok = false; break; }
-        if (arg < 0 || c < m) { m = c; arg = p+j; }
-      }
-      int parg = -1; bool pok = false;
-      if (p > 0) {
-        uint64_t pm = ~0ULL; pok = true;
-        for (int j = 0; j < win; j++) {
-          uint64_t c = cand[p-1+j];
-          if (c == ~0ULL) { pok = false; break; }
-          if (parg < 0 || c < pm) { pm = c; parg = p-1+j; }
-        }
+        if (c < m) m = c;
       }
       val[p] = ok ? (m ^ tog) : 0;
-      flag[p] = (ok && (!pok || arg != parg)) ? 1 : 0;
+      flag[p] = ok ? 1 : 0;
     }
     // The two rejections are independent and must not be folded into one
     // array.  A minimizer dropped by the subsampling filter still counts as
@@ -242,10 +237,13 @@ int main(int argc, char **argv) {
     int count = n_kmer ? scan[n_kmer-1] : 0;
 
     if (taxa_mode) {
-      // One entry per reported minimizer.  A repeat inherits the taxon set at
-      // the start of its equal-value run, and a run whose start was dropped by
-      // the subsampling filter contributes zero, which is exactly what
-      // last_taxon does sequentially on the CPU.
+      // One lookup per run of equal consecutive minimizers, at its start
+      // (look[]), as in the kernel.  Every k-mer of the run inherits that
+      // taxon, and a run whose start the subsampling filter dropped
+      // contributes zero, which is what last_taxon does sequentially on the
+      // CPU.
+      std::vector<uint32_t> ptax(n_kmer, 0);
+      for (int p = 0; p < n_kmer; p++) if (look[p]) ptax[p] = table.get(val[p]);
       std::vector<uint32_t> gt;
       for (int p = 0; p < n_kmer; p++) {
         if (!flag[p]) continue;
@@ -255,9 +253,7 @@ int main(int argc, char **argv) {
           if (q < 0 || val[q] != val[p]) break;
           start = q; q--;
         }
-        bool filtered = mahv && murmur(val[start]) < mahv;
-        gt.push_back(filtered ? 0u
-                              : probe(table, cap, val[p], (int) key_bits, (int) value_bits));
+        gt.push_back(look[start] ? ptax[start] : 0u);
       }
       if (call_mode) {
         // Distinct taxa and their counts, then Kraken 2's tree resolution.
@@ -301,7 +297,7 @@ int main(int argc, char **argv) {
       if (!look[p]) continue;
       int slot = scan[p] - 1;
       gk[slot] = val[p];
-      gt[slot] = probe(table, cap, val[p], (int) key_bits, (int) value_bits);
+      gt[slot] = table.get(val[p]);
     }
 
     uint32_t c; if (fread(&c,4,1,rf)!=1) break;

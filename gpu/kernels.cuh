@@ -6,15 +6,12 @@
 
 #include <cstdint>
 #include <cuda_runtime_api.h>
+#include "table.h"
 
 static const int MAX_LEN = 320;
 static const int THREADS = 128;
 
-__host__ __device__ __forceinline__ uint64_t murmur(uint64_t k) {
-  k ^= k >> 33; k *= 0xff51afd7ed558ccdULL;
-  k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL;
-  k ^= k >> 33; return k;
-}
+__host__ __device__ __forceinline__ uint64_t murmur(uint64_t k) { return k2t::murmur(k); }
 
 __device__ __forceinline__ uint64_t revcomp(uint64_t kmer, int n) {
   kmer = ((kmer & 0xCCCCCCCCCCCCCCCCULL) >> 2) | ((kmer & 0x3333333333333333ULL) << 2);
@@ -23,26 +20,6 @@ __device__ __forceinline__ uint64_t revcomp(uint64_t kmer, int n) {
   kmer = ((kmer & 0xFFFF0000FFFF0000ULL) >> 16) | ((kmer & 0x0000FFFF0000FFFFULL) << 16);
   kmer = (kmer >> 32) | (kmer << 32);
   return ((~kmer) >> (64 - n * 2)) & ((1ULL << (n * 2)) - 1);
-}
-
-// Linear probing over 4-byte cells, key in the high bits, value in the low.
-// A value of zero marks an empty cell, which is also the miss return.
-__device__ __forceinline__ uint32_t probe(const uint32_t *__restrict__ table,
-                                          uint64_t capacity, uint64_t key,
-                                          int key_bits, int value_bits) {
-  uint64_t hc = murmur(key);
-  uint32_t compacted = (uint32_t) (hc >> (64 - key_bits));
-  uint64_t idx = hc % capacity;
-  uint64_t first = idx;
-  const uint32_t vmask = (1u << value_bits) - 1;
-  while (true) {
-    uint32_t cell = table[idx];
-    uint32_t val = cell & vmask;
-    if (!val) return 0;
-    if ((cell >> value_bits) == compacted) return val;
-    if (++idx == capacity) idx = 0;
-    if (idx == first) return 0;
-  }
 }
 
 __device__ __forceinline__ bool is_ancestor(const uint64_t *__restrict__ parent,
@@ -90,8 +67,7 @@ __global__ void fused(const char *__restrict__ bases,
                       uint32_t n_reads, int k, int l,
                       uint64_t spaced_seed_mask, uint64_t toggle_mask,
                       uint64_t min_acceptable,
-                      const uint32_t *__restrict__ table, uint64_t capacity,
-                      int key_bits, int value_bits,
+                      const k2t::Table table, int skip_probe,
                       uint64_t *__restrict__ out_key,
                       uint32_t *__restrict__ out_tax,
                       uint32_t *__restrict__ out_count,
@@ -113,6 +89,7 @@ __global__ void fused(const char *__restrict__ bases,
   __shared__ int      scan[MAX_LEN];
   __shared__ int      tmp[MAX_LEN];
   __shared__ uint32_t stax[MAX_LEN];
+  __shared__ uint32_t ptax[MAX_LEN];
   __shared__ int amb_read;
 
   for (uint32_t r = blockIdx.x; r < n_reads; r += gridDim.x) {
@@ -157,28 +134,17 @@ __global__ void fused(const char *__restrict__ bases,
     int n_kmer = len - k + 1; if (n_kmer < 1) n_kmer = 0;
     int win = k - l + 1;
 
-    // A position reports a minimizer when the winning l-mer position changes,
-    // which is what the CPU's deque does; the value alone is not enough,
-    // because inside a tandem repeat the winner can change while the value
-    // stays equal.
+    // Every k-mer whose window holds k - l + 1 unambiguous l-mers reports a
+    // token, as MinimizerScanner::NextMinimizer does once per k-mer.
     for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
-      int arg = -1; uint64_t m = ~0ULL; bool ok = true;
+      uint64_t m = ~0ULL; bool ok = true;
       for (int j = 0; j < win; j++) {
         uint64_t c = cand[p + j];
         if (c == ~0ULL) { ok = false; break; }
-        if (arg < 0 || c < m) { m = c; arg = p + j; }
-      }
-      int parg = -1; bool pok = false;
-      if (p > 0) {
-        uint64_t pm = ~0ULL; pok = true;
-        for (int j = 0; j < win; j++) {
-          uint64_t c = cand[p - 1 + j];
-          if (c == ~0ULL) { pok = false; break; }
-          if (parg < 0 || c < pm) { pm = c; parg = p - 1 + j; }
-        }
+        if (c < m) m = c;
       }
       val[p] = ok ? (m ^ toggle_mask) : 0;
-      flag[p] = (ok && (!pok || arg != parg)) ? 1 : 0;
+      flag[p] = ok ? 1 : 0;
     }
     __syncthreads();
 
@@ -217,11 +183,20 @@ __global__ void fused(const char *__restrict__ bases,
       __syncthreads();
     }
 
-    // One entry per reported minimizer.  A repeat inherits the taxon set at the
+    // One table lookup per run of equal consecutive minimizers, at the run's
+    // first k-mer, unless the subsampling filter dropped it; look[] marks
+    // exactly those positions.  This is the CPU's rule: ClassifySequence looks
+    // a minimizer up only when it differs from the previous one.
+    for (int p = threadIdx.x; p < n_kmer; p += blockDim.x)
+      // skip_probe exists for timing: it removes the table lookup and nothing
+      // else, so the difference in kernel time is the lookup's cost.
+      if (look[p]) ptax[p] = skip_probe ? 0u : table.get(val[p]);
+    __syncthreads();
+
+    // One entry per reported k-mer.  A repeat inherits the taxon found at the
     // start of its equal-value run, and a run whose start the subsampling
     // filter dropped contributes zero, which is what last_taxon does
-    // sequentially on the CPU.  Expressed this way it needs no scan: the run
-    // start is a short walk back.
+    // sequentially on the CPU.  The run start is a short walk back.
     uint32_t obase = out_offsets ? out_offsets[r] : 0u;
     for (int p = threadIdx.x; p < n_kmer; p += blockDim.x) {
       if (!flag[p]) continue;
@@ -231,12 +206,8 @@ __global__ void fused(const char *__restrict__ bases,
         if (q < 0 || val[q] != val[p]) break;
         start = q; q--;
       }
-      bool filtered = min_acceptable && murmur(val[start]) < min_acceptable;
       int slot = scan[p] - 1;
-      uint32_t t = filtered
-          ? 0u : probe(table, capacity, val[p], key_bits, value_bits);
-      // The per-token arrays exist for the verification harness.  The pipeline
-      // wants only the call, and passes null rather than sizing them.
+      uint32_t t = look[start] ? ptax[start] : 0u;
       if (out_key) out_key[obase + slot] = val[p];
       if (out_tax) out_tax[obase + slot] = t;
       stax[slot] = t;

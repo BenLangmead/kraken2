@@ -142,10 +142,14 @@ int main(int argc, char **argv) {
   CK(cudaMemcpy(d_l, lens.data(), nr*4, cudaMemcpyHostToDevice));
   CK(cudaMemcpy(d_oo, ooff.data(), (nr+1)*4, cudaMemcpyHostToDevice));
 
+  k2t::Table cht{};
+  cht.kind = k2t::Table::CHT; cht.cells = d_table; cht.capacity = capacity;
+  cht.key_bits = (int) key_bits; cht.value_bits = (int) value_bits;
   int blocks = 8192;
   fused<<<blocks, THREADS>>>(d_b,d_o,d_l,(uint32_t)nr,k,l,ssm,tog,mahv,
-                             d_table,capacity,(int)key_bits,(int)value_bits,
-                             d_key,d_tax,d_cnt,d_oo,d_parent,d_extid,d_call);
+                             cht,0,
+                             d_key,d_tax,d_cnt,d_oo,d_parent,d_extid,d_call,
+                             nullptr,nullptr,nullptr,0,nullptr,nullptr,nullptr);
   CK(cudaDeviceSynchronize());
 
   cudaEvent_t a,b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
@@ -153,8 +157,9 @@ int main(int argc, char **argv) {
   CK(cudaEventRecord(a));
   for (int i = 0; i < reps; i++)
     fused<<<blocks, THREADS>>>(d_b,d_o,d_l,(uint32_t)nr,k,l,ssm,tog,mahv,
-                               d_table,capacity,(int)key_bits,(int)value_bits,
-                               d_key,d_tax,d_cnt,d_oo,d_parent,d_extid,d_call);
+                               cht,0,
+                               d_key,d_tax,d_cnt,d_oo,d_parent,d_extid,d_call,
+                               nullptr,nullptr,nullptr,0,nullptr,nullptr,nullptr);
   CK(cudaEventRecord(b)); CK(cudaDeviceSynchronize());
   float ms=0; cudaEventElapsedTime(&ms,a,b); ms/=reps;
   printf("\nfused scan+filter+probe   %.2f ms   %.2f Mbase/s   %.1f Mread/s\n",

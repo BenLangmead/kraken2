@@ -44,24 +44,10 @@ struct IdxEnt { uint64_t coff, uoff, rec; };
 // it emits the ambiguous spans exactly, including the token-per-character it
 // produces while recovering, which is what the device version gets wrong.
 struct HostFallback {
-  const uint32_t *table; uint64_t capacity; int key_bits, value_bits;
+  k2t::Table table;
   const uint64_t *parent, *extid; uint64_t mahv;
   kraken2::MinimizerScanner *scanner;
 
-  uint32_t probe_host(uint64_t key) const {
-    uint64_t hc = murmur(key);
-    uint32_t compacted = (uint32_t) (hc >> (64 - key_bits));
-    uint64_t idx = hc % capacity, first = idx;
-    const uint32_t vmask = (1u << value_bits) - 1;
-    while (true) {
-      uint32_t cell = table[idx];
-      uint32_t v = cell & vmask;
-      if (!v) return 0;
-      if ((cell >> value_bits) == compacted) return v;
-      if (++idx == capacity) idx = 0;
-      if (idx == first) return 0;
-    }
-  }
   bool is_anc(uint64_t a, uint64_t b) const {
     if (!a || !b) return false;
     while (b > a) b = parent[b];
@@ -87,7 +73,7 @@ struct HostFallback {
       if (*mp != last_min) {
         last_min = *mp;
         if (mahv && murmur(*mp) < mahv) { taxon = 0; last_taxon = 0; }
-        else { taxon = probe_host(*mp); last_taxon = taxon; }
+        else { taxon = table.get(*mp); last_taxon = taxon; }
       } else taxon = last_taxon;
       if (taxon) hits[taxon]++;
       taxa.push_back(taxon);
@@ -144,6 +130,10 @@ int main(int argc, char **argv) {
   size_t max_chunks = argc > 8 ? (size_t) atoll(argv[8]) : (size_t) -1;
   // Writing the answer is part of the job, so it is timed with the rest.
   const char *out_path = getenv("K2GPU_OUT");
+  // K2GPU_SKIP_PROBE=1 replaces every table lookup by a miss, so the change in
+  // the classify kernel's time is the lookup's share.  Output is then wrong
+  // by design and the call check fails.
+  int skip_probe = getenv("K2GPU_SKIP_PROBE") ? atoi(getenv("K2GPU_SKIP_PROBE")) : 0;
   size_t chunks_done = 0;
 
   // ---- index ----
@@ -174,44 +164,94 @@ int main(int argc, char **argv) {
   uint64_t ssm = o[2], tog = o[3], mahv = o[5];
 
   // ---- hash table ----
-  uint64_t capacity, key_bits, value_bits;
-  uint32_t *d_table = nullptr;
-  {
-    int hf = open(argv[3], O_RDONLY);
-    uint64_t hdr[4];
-    if (hf < 0 || read(hf, hdr, sizeof hdr) < (ssize_t) sizeof hdr) { perror("hash"); return 1; }
-    capacity = hdr[0]; key_bits = hdr[2]; value_bits = hdr[3];
-    size_t tb = capacity * 4;
-    CK(cudaMalloc(&d_table, tb));
-    const size_t CH = 256u << 20;
-    std::vector<char> buf(CH);
-    size_t done = 0;
-    while (done < tb) {
-      size_t want = std::min(CH, tb - done), got = 0;
+  // The file's first 8 bytes say which table it is, as in classify.  The
+  // device copy and the host view (used by the fallback path) share one
+  // k2t::Table description and differ only in where the pointers point.
+  // Mapping the file costs nothing until a page is touched, and the fallback
+  // touches only a handful.
+  double t_load0 = now_s();
+  k2t::Table d_tab{}, h_tab{};
+  size_t table_bytes = 0;
+  int hf = open(argv[3], O_RDONLY);
+  struct stat hst;
+  if (hf < 0 || fstat(hf, &hst) != 0) { perror("hash"); return 1; }
+  char *hmap = (char *) mmap(nullptr, hst.st_size, PROT_READ, MAP_PRIVATE, hf, 0);
+  if (hmap == MAP_FAILED) { perror("mmap hash"); return 1; }
+  // Copies [off, off + n) of the file to the device in 256 MB pieces through
+  // a pinned buffer.
+  const size_t LOAD_CH = 256u << 20;
+  char *load_pin; CK(cudaHostAlloc(&load_pin, LOAD_CH, cudaHostAllocDefault));
+  auto upload = [&](void *dst, size_t off, size_t n) {
+    for (size_t done = 0; done < n; ) {
+      size_t want = std::min(LOAD_CH, n - done), got = 0;
       while (got < want) {
-        ssize_t n = pread(hf, buf.data() + got, want - got, 32 + done + got);
-        if (n <= 0) break;
-        got += n;
+        ssize_t r = pread(hf, load_pin + got, want - got, off + done + got);
+        if (r <= 0) { fprintf(stderr, "short read in %s\n", argv[3]); exit(1); }
+        got += r;
       }
-      CK(cudaMemcpy((char *) d_table + done, buf.data(), got, cudaMemcpyHostToDevice));
+      CK(cudaMemcpy((char *) dst + done, load_pin, got, cudaMemcpyHostToDevice));
       done += got;
-      if (got < want) break;
     }
-    close(hf);
-    printf("table: %.2f GB resident\n", done / 1e9);
+  };
+  uint64_t magic; memcpy(&magic, hmap, 8);
+  size_t blk_bucket_off = 0;
+  if (magic == k2t::BLOCKED_MAGIC) {
+    k2t::BlockedHeader bh; memcpy(&bh, hmap, sizeof bh);
+    if (bh.version != 1 || bh.bucket_bytes != 64) {
+      fprintf(stderr, "unsupported blocked table version\n"); return 1;
+    }
+    h_tab.kind = k2t::Table::BLOCKED;
+    h_tab.G.init(bh);
+    if ((uint32_t) h_tab.G.S != bh.slots || (uint32_t) h_tab.G.sf != bh.spill_bits ||
+        (uint32_t) h_tab.G.B != bh.key_bits) {
+      fprintf(stderr, "blocked table header is inconsistent\n"); return 1;
+    }
+    size_t nbk = (size_t) (h_tab.G.P * h_tab.G.nb) * 64;
+    blk_bucket_off = k2t::BLOCKED_HEADER_BYTES;
+    size_t off_o = blk_bucket_off + nbk;
+    size_t off_k = off_o + (h_tab.G.P + 1) * 8;
+    size_t off_v = off_k + bh.stash_entries * 8;
+    h_tab.buckets = (const uint8_t *) (hmap + blk_bucket_off);
+    h_tab.part_base = 0;
+    h_tab.stash_off = (const uint64_t *) (hmap + off_o);
+    h_tab.stash_key = (const uint64_t *) (hmap + off_k);
+    h_tab.stash_val = (const uint32_t *) (hmap + off_v);
+    d_tab = h_tab;
+    uint64_t *dso, *dsk = nullptr; uint32_t *dsv = nullptr;
+    CK(cudaMalloc(&dso, (h_tab.G.P + 1) * 8));
+    upload(dso, off_o, (h_tab.G.P + 1) * 8);
+    if (bh.stash_entries) {
+      CK(cudaMalloc(&dsk, bh.stash_entries * 8)); upload(dsk, off_k, bh.stash_entries * 8);
+      CK(cudaMalloc(&dsv, bh.stash_entries * 4)); upload(dsv, off_v, bh.stash_entries * 4);
+    }
+    d_tab.stash_off = dso; d_tab.stash_key = dsk; d_tab.stash_val = dsv;
+    table_bytes = nbk;
+    printf("table: blocked, %" PRIu64 " partitions of %" PRIu64 " buckets, "
+           "%d slots of %d bits, %d-bit spill filter, stash %" PRIu64 "\n",
+           h_tab.G.P, h_tab.G.nb, h_tab.G.S, h_tab.G.w, h_tab.G.sf, bh.stash_entries);
+  } else {
+    uint64_t hdr[4]; memcpy(hdr, hmap, sizeof hdr);
+    h_tab.kind = k2t::Table::CHT;
+    h_tab.capacity = hdr[0]; h_tab.key_bits = (int) hdr[2]; h_tab.value_bits = (int) hdr[3];
+    h_tab.cells = (const uint32_t *) (hmap + 32);
+    d_tab = h_tab;
+    table_bytes = h_tab.capacity * 4;
+    printf("table: compact hash, capacity %" PRIu64 ", %d key bits, %d value bits\n",
+           h_tab.capacity, h_tab.key_bits, h_tab.value_bits);
   }
-
-  // A host view of the same table for the fallback path.  Mapping it costs
-  // nothing until a page is touched, and only a handful ever are.
-  const uint32_t *h_table = nullptr;
-  {
-    int hf = open(argv[3], O_RDONLY);
-    struct stat st; fstat(hf, &st);
-    char *m = (char *) mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, hf, 0);
-    if (m == MAP_FAILED) { perror("mmap hash"); return 1; }
-    h_table = (const uint32_t *) (m + 32);
-    close(hf);
+  // The whole table resident on the device.
+  if (h_tab.kind == k2t::Table::BLOCKED) {
+    uint8_t *db; CK(cudaMalloc(&db, table_bytes));
+    upload(db, blk_bucket_off, table_bytes);
+    d_tab.buckets = db;
+  } else {
+    uint32_t *dc; CK(cudaMalloc(&dc, table_bytes));
+    upload(dc, 32, table_bytes);
+    d_tab.cells = dc;
   }
+  CK(cudaDeviceSynchronize());
+  double t_load = now_s() - t_load0;
+  printf("table: %.2f GB resident, loaded in %.2f s\n", table_bytes / 1e9, t_load);
 
   // ---- taxonomy: parent and external id only ----
   uint64_t *d_parent, *d_extid, node_count;
@@ -306,8 +346,7 @@ int main(int argc, char **argv) {
   int out_fd = -1;
   size_t out_bytes = 0, n_fallback = 0;
   kraken2::MinimizerScanner fb_scanner(k, l, ssm, true, tog, (int) o[6]);
-  HostFallback fb_ctx{h_table, capacity, (int) key_bits, (int) value_bits,
-                      h_par.data(), h_ext.data(), mahv, &fb_scanner};
+  HostFallback fb_ctx{h_tab, h_par.data(), h_ext.data(), mahv, &fb_scanner};
   if (out_path) {
     out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) { fprintf(stderr, "cannot write %s\n", out_path); return 1; }
@@ -315,6 +354,15 @@ int main(int argc, char **argv) {
   }
 
   // ---- the pipeline ----
+  // Stage times: device stages by events on the one stream, host stages by
+  // the clock.  The pipeline synchronizes once per chunk, so the stages run
+  // one after another and their sum is close to the end-to-end time.
+  enum { E_H2D, E_INFLATE, E_PARSE, E_CLASSIFY, E_OUTPUT, E_END, N_EV };
+  static const char *stage_name[N_EV - 1] =
+      {"copy in", "inflate", "parse", "classify (scan+probe+resolve+format)", "pack + copy out"};
+  cudaEvent_t ev[N_EV];
+  for (int i = 0; i < N_EV; i++) CK(cudaEventCreate(&ev[i]));
+  double stage_ms[N_EV - 1] = {0}, t_read = 0, t_write = 0;
   CK(cudaDeviceSynchronize());
   double t0 = now_s();
   uint64_t done_reads = 0;
@@ -325,12 +373,15 @@ int main(int argc, char **argv) {
     size_t clen = ent[b1].coff - ent[b0].coff;
     size_t nrec = ent[b1].rec - ent[b0].rec;
 
+    double tr = now_s();
     size_t got = 0;
     while (got < clen) {
       ssize_t n = pread(bgz, h_pin + got, clen - got, ent[b0].coff + got);
       if (n <= 0) break;
       got += n;
     }
+    t_read += now_s() - tr;
+    CK(cudaEventRecord(ev[E_H2D], stream));
     CK(cudaMemcpyAsync(d_cbuf, h_pin, clen, cudaMemcpyHostToDevice, stream));
 
     for (size_t i = 0; i < nb; i++) {
@@ -349,6 +400,7 @@ int main(int argc, char **argv) {
     CK(cudaMemcpyAsync(d_buoff, buoff.data(), (nb+1)*8, cudaMemcpyHostToDevice, stream));
     CK(cudaMemcpyAsync(d_brec,  brec.data(),  (nb+1)*8, cudaMemcpyHostToDevice, stream));
 
+    CK(cudaEventRecord(ev[E_INFLATE], stream));
     NK(nvcompBatchedGzipDecompressAsync((const void *const *) d_cptr, d_cb, d_ub,
         d_ac, nb, d_temp, temp_bytes, (void *const *) d_uptr, nopts, d_st, stream));
 
@@ -371,17 +423,20 @@ int main(int argc, char **argv) {
       if (nbad || nshort) { fprintf(stderr, "decompression did not agree with the index\n"); return 2; }
     }
 
+    CK(cudaEventRecord(ev[E_PARSE], stream));
     parse_blocks<<<(unsigned) std::min(nb, (size_t) 8192), 256, shmem, stream>>>(
         d_ubuf, d_buoff, d_brec, ent[b0].uoff, (uint32_t) nb, ent[b0].rec,
         d_off, d_len, d_hoff, d_hlen);
 
     if (out_path) CK(cudaMemsetAsync(d_amb, 0, nrec, stream));
+    CK(cudaEventRecord(ev[E_CLASSIFY], stream));
     fused<<<8192, THREADS, 0, stream>>>(
         d_ubuf, d_off, d_len, (uint32_t) nrec, k, l, ssm, tog, mahv,
-        d_table, capacity, (int) key_bits, (int) value_bits,
+        d_tab, skip_probe,
         nullptr, nullptr, nullptr, nullptr, d_parent, d_extid, d_call,
         d_hoff, d_hlen, d_text, TEXT_STRIDE, d_llen, d_over, d_amb);
 
+    CK(cudaEventRecord(ev[E_OUTPUT], stream));
     if (out_path) {
       uint32_t nblk = (uint32_t) ((nrec + 255) / 256);
       scan_pass1<<<nblk, 256, 0, stream>>>(d_llen, d_loff, d_sums, (uint32_t) nrec);
@@ -400,7 +455,9 @@ int main(int argc, char **argv) {
         return 1;
       }
       CK(cudaMemcpyAsync(h_out, d_packed, tbytes, cudaMemcpyDeviceToHost, stream));
+      CK(cudaEventRecord(ev[E_END], stream));
       CK(cudaStreamSynchronize(stream));
+      double tw = now_s();
       // Reads the kernel declined contribute no bytes, so their line belongs
       // exactly at their offset.  Splice the host's version in there.
       std::vector<uint8_t> amb(nrec);
@@ -440,11 +497,15 @@ int main(int argc, char **argv) {
         }
         emit(h_out + pos, tbytes - pos);
       }
-    }
+      t_write += now_s() - tw;
+    } else CK(cudaEventRecord(ev[E_END], stream));
 
     CK(cudaMemcpyAsync(h_call.data() + done_reads, d_call, nrec*4,
                        cudaMemcpyDeviceToHost, stream));
     CK(cudaStreamSynchronize(stream));
+    for (int i = 0; i < N_EV - 1; i++) {
+      float ms; CK(cudaEventElapsedTime(&ms, ev[i], ev[i + 1])); stage_ms[i] += ms;
+    }
     done_reads += nrec;
     if (++chunks_done >= max_chunks) break;
   }
@@ -455,6 +516,9 @@ int main(int argc, char **argv) {
          el, ih.total_uncompressed * 0.4 / el / 1e9, done_reads / el / 1e6,
          done_reads / 1e6);
   printf("             (bases are about 40%% of the FASTQ bytes)\n");
+  printf("stage times (s):\n  %-40s %8.3f\n", "read input (host)", t_read);
+  for (int i = 0; i < N_EV - 1; i++) printf("  %-40s %8.3f\n", stage_name[i], stage_ms[i] / 1e3);
+  printf("  %-40s %8.3f\n", "write output + fallback (host)", t_write);
   if (out_bytes) {
     uint32_t over = 0;
     CK(cudaMemcpy(&over, d_over, 4, cudaMemcpyDeviceToHost));
