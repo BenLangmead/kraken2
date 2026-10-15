@@ -272,10 +272,10 @@ int main(int argc, char **argv) {
     n_slots = n_groups == 1 ? 1 : 2;
     size_t group_bytes = table_bytes / n_groups;
     for (int s = 0; s < n_slots; s++) CK(cudaMalloc(&d_slot[s], group_bytes));
-    // Host-to-device rates for the same 1 GB of buckets: pinned (as the
-    // group copies use) and pageable (the file mapping, already in the page
-    // cache, as the earlier measurement used).
-    size_t nb_test = std::min(table_bytes, (size_t) 1 << 30);
+    // Host-to-device rates for the same bytes of buckets (one slot, at most
+    // 1 GB): pinned, as the group copies use, and pageable, from the file
+    // mapping already in the page cache, as the earlier measurement used.
+    size_t nb_test = std::min(group_bytes, (size_t) 1 << 30);
     for (int rep = 0; rep < 2; rep++) {
       double t1 = now_s();
       CK(cudaMemcpy(d_slot[0], h_buckets, nb_test, cudaMemcpyHostToDevice));
@@ -283,8 +283,8 @@ int main(int argc, char **argv) {
       CK(cudaMemcpy(d_slot[0], hmap + blk_bucket_off, nb_test, cudaMemcpyHostToDevice));
       double t3 = now_s();
       if (rep == 1)
-        printf("host to device, 1 GB: pinned %.1f GB/s, pageable %.1f GB/s\n",
-               nb_test / 1e9 / (t2 - t1), nb_test / 1e9 / (t3 - t2));
+        printf("host to device, %.2f GB: pinned %.1f GB/s, pageable %.1f GB/s\n",
+               nb_test / 1e9, nb_test / 1e9 / (t2 - t1), nb_test / 1e9 / (t3 - t2));
     }
   } else if (h_tab.kind == k2t::Table::BLOCKED) {
     uint8_t *db; CK(cudaMalloc(&db, table_bytes));
