@@ -8,11 +8,11 @@ agree with it, and each records a measurement taken on an L40S (`g6e`, us-east-1
 | `scan_kernel.cu` | minimizer scan, one block per read | exact on 200,000 reads; 50.4 Gbase/s |
 | `probe_bench.cu` | random gather modelling the compact hash probe | 5,397 Mprobe/s vs 580 on 32 CPU threads |
 | `gpu_inflate.cc` | nvCOMP gzip decode of record-aligned BGZF blocks | byte-exact vs the original FASTQ; 34.3 GB/s |
-| `fused.cu` | scan, subsample and probe together, real 16 GB table | logic verified via `emul.cc`; not yet run on a device |
-| `emul.cc` | host emulation of `fused.cu`, minus the CUDA parts | exact on 50,000 reads / 262,335 lookups |
+| `emul.cc` | host emulation of the fused kernel, minus the CUDA parts | every line identical to classify on 2M reads and 2M pairs, both tables |
 | `kernels.cuh` | the device kernels, shared so the two programs cannot drift | &mdash; |
-| `table.h` | the table as host and device see it: compact hash or blocked, chosen by magic number | shared by the kernels, the host fallback and `emul.cc` |
-| `k2gpu.cu` | end to end: BGZF in, one call per read out; can stream a blocked table in groups of partitions | byte-identical to classify with either table, resident or streamed (10M reads, L40S) |
+| `classify_core.h` | Kraken 2's scanner for mates with ambiguous bases, tree resolution, line formatting | shared by the kernel and `emul.cc` |
+| `table.h` | the table as host and device see it: compact hash or blocked, chosen by magic number | shared by the kernels and `emul.cc` |
+| `k2gpu.cu` | end to end: BGZF in (single-end, or interleaved pairs from `k2bgzf in1.fq in2.fq`), one line per read or pair out; can stream a blocked table in groups of partitions | byte-identical to classify with either table, single-end or paired, resident or streamed (10M reads or pairs, L40S) |
 
 `emul.cc` exists because device time is the scarce resource.  Running the
 kernel's logic on the host first caught two defects that would otherwise have
@@ -25,7 +25,6 @@ The oracle both are checked against comes from `src/k2mindump.cc`.
 
 ## Building
 
-    nvcc -O3 -std=c++14 -arch=sm_89 -o fused fused.cu
     g++  -O3 -std=c++11 -o emul emul.cc
 
 `gpu_inflate.cc` and `k2gpu.cu` additionally need nvCOMP.  Use 5.3 or later:
