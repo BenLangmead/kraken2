@@ -48,8 +48,15 @@ class MinimizerScanner {
   ssize_t k() const { return k_; }
   ssize_t l() const { return l_; }
   bool is_dna() const { return dna_; }
+  // NextMinimizer increments queue_pos_ before it returns, so a window holds
+  // all k - l + 1 l-mers only once queue_pos_ exceeds k - l.  Testing with <=
+  // marks the k-mer that starts on an ambiguous base, and the first window
+  // of a subblock that starts past position 0, as ambiguous; both would
+  // otherwise report a minimum over k - l l-mers.  When k == l there is no
+  // window and NextMinimizer returns before queue_pos_ moves, so only
+  // last_ambig_ applies.
   bool is_ambiguous() const {
-    return (queue_pos_ < k_ - l_) || (!! last_ambig_);
+    return (k_ > l_ && queue_pos_ <= k_ - l_) || (!! last_ambig_);
   }
 
   private:
