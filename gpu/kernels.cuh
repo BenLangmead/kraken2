@@ -18,13 +18,14 @@ __host__ __device__ __forceinline__ uint64_t murmur(uint64_t k) { return k2t::mu
 // table that is resident.  The other three serve a blocked table that is
 // streamed in groups of whole partitions:
 //   PROBE_GROUP   recompute the minimizers, look up those whose partition is
-//                 in [part_lo, part_hi), and store each result in tok_tax
+//                 in [part_lo, part_hi), and store each value as the table
+//                 holds it (a taxon code in version 2) in tok_tax
 //   BIN           compute the minimizers once and append each lookup's hash
 //                 to its partition's bin, recording in tok_ref which bin
 //                 entry will hold its result, for probe_bins
-//   FINISH        recompute the minimizers, take each lookup's taxon from
-//                 tok_tax (or through tok_ref from bin_v), and resolve and
-//                 format as CLASSIFY does
+//   FINISH        recompute the minimizers, take each lookup's value from
+//                 tok_tax (or through tok_ref from bin_v), decode it to a
+//                 taxon, and resolve and format as CLASSIFY does
 // Every key lives in exactly one partition and a lookup never leaves it, so
 // after all groups every lookup has the value a resident table gives.
 enum Phase { CLASSIFY = 0, PROBE_GROUP = 1, BIN = 2, FINISH = 3 };
@@ -33,8 +34,8 @@ struct StreamArgs {
   int phase;
   // Per-token state: token t of mate m of unit r of this launch is entry
   // tok_base + r * tok_stride + m * mate_stride + t.  Only tokens that are
-  // lookups are written and read.  tok_tax holds taxa (rescan); tok_ref holds
-  // bin entry indices (bins).
+  // lookups are written and read.  tok_tax holds stored values (rescan);
+  // tok_ref holds bin entry indices (bins).
   uint16_t *tok_tax;
   uint32_t *tok_ref;
   uint64_t tok_base;
@@ -59,7 +60,7 @@ __device__ __forceinline__ uint32_t lookup_token(const k2t::Table &table, const 
       uint64_t h = table.G.hash(key);
       uint32_t part = (uint32_t) table.G.part_of(h);
       if (part >= sa.part_lo && part < sa.part_hi)
-        sa.tok_tax[pos] = (uint16_t) table.get_blocked_hash(h);
+        sa.tok_tax[pos] = (uint16_t) table.get_blocked_code(h);
       return 0;
     }
     case BIN: {
@@ -74,7 +75,8 @@ __device__ __forceinline__ uint32_t lookup_token(const k2t::Table &table, const 
       return 0;
     }
     case FINISH:
-      return sa.tok_ref ? (uint32_t) sa.bin_v[sa.tok_ref[pos]] : (uint32_t) sa.tok_tax[pos];
+      return table.decode(sa.tok_ref ? (uint32_t) sa.bin_v[sa.tok_ref[pos]]
+                                     : (uint32_t) sa.tok_tax[pos]);
     default:
       // skip_probe exists for timing: it removes the table lookup and nothing
       // else, so the difference in kernel time is the lookup's cost.
@@ -246,7 +248,8 @@ __global__ void fused(const char *__restrict__ bases,
 }
 
 // Looks up the binned minimizers of partitions [part_lo, part_hi), one thread
-// per minimizer, and stores each result next to its minimizer.  Bins are
+// per minimizer, and stores each value as the table holds it next to its
+// minimizer.  Bins are
 // visited in partition order, so the threads running at any moment work
 // within a few partitions, which can sit in L2, and both the reads and the
 // stores are sequential.
@@ -262,8 +265,8 @@ __global__ void probe_bins(const k2t::Table table,
     uint32_t b = part_lo + (uint32_t) (j / bin_cap), e = (uint32_t) (j % bin_cap);
     if (e >= bin_cnt[b]) continue;
     uint64_t at = bin_base + (uint64_t) b * bin_cap + e;
-    uint32_t v = table.get_blocked_hash(bin_h[at]);
-    // A taxon never equals 0xFFFF0000, so with no_write nothing is stored,
+    uint32_t v = table.get_blocked_code(bin_h[at]);
+    // A stored value never equals 0xFFFF0000, so with no_write nothing is stored,
     // but the lookup cannot be optimized away.
     if (!no_write || v == 0xFFFF0000u) bin_v[at] = (uint16_t) v;
   }

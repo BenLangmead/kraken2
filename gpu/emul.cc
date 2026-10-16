@@ -70,17 +70,12 @@ int main(int argc, char **argv) {
   k2t::Table table{};
   uint64_t tmagic; memcpy(&tmagic, map, 8);
   if (tmagic == k2t::BLOCKED_MAGIC) {
-    k2t::BlockedHeader bh; memcpy(&bh, map, sizeof bh);
-    table.kind = k2t::Table::BLOCKED;
-    table.G.init(bh);
-    size_t nbk = (size_t) (table.G.P * table.G.nb) * 64;
-    size_t off_o = k2t::BLOCKED_HEADER_BYTES + nbk, off_k = off_o + (table.G.P + 1) * 8;
-    table.buckets = (const uint8_t *) (map + k2t::BLOCKED_HEADER_BYTES);
-    table.stash_off = (const uint64_t *) (map + off_o);
-    table.stash_key = (const uint64_t *) (map + off_k);
-    table.stash_val = (const uint32_t *) (map + off_k + bh.stash_entries * 8);
-    printf("k=%d l=%d blocked: %" PRIu64 " partitions of %" PRIu64 " buckets, r=%d v=%d\n",
-           k, l, table.G.P, table.G.nb, table.G.r, table.G.v);
+    k2t::BlockedHeader bh;
+    if (const char *e = k2t::map_blocked(map, st.st_size, table, bh)) {
+      fprintf(stderr, "%s: %s\n", argv[2], e); return 1;
+    }
+    printf("k=%d l=%d blocked: version %u, %" PRIu64 " partitions of %" PRIu64
+           " buckets, r=%d v=%d\n", k, l, bh.version, table.G.P, table.G.nb, table.G.r, table.G.v);
   } else {
     uint64_t hdr[4]; memcpy(hdr, map, sizeof hdr);
     table.kind = k2t::Table::CHT;

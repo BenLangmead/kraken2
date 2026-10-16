@@ -121,9 +121,42 @@ struct BlockedHeader {
            value_bits, slots, spill_bits;
   uint64_t buckets_per_partition, entries, stash_entries, pext_mask,
            guests, spilled_buckets;
+  // Version 2: U, the size of the code-to-taxon array less 1.  A version 1
+  // file holds kept_partitions here instead; read_blocked_header moves it.
+  uint64_t taxon_codes;
+  uint64_t kept_partitions;   // K; 0 means all P partitions
+};
+
+// Byte offsets of the parts of a blocked table file after the header: the
+// buckets, the K + 1 stash offsets, the stash keys and taxon codes, and in
+// version 2 the code-to-taxon array, which follows the stash.
+struct BlockedLayout {
+  size_t buckets, stash_off, stash_key, stash_val, code_taxa, end;
 };
 static const uint64_t BLOCKED_MAGIC = 0x3130544B4C42324BULL;   // "K2BLKT01"
 static const size_t BLOCKED_HEADER_BYTES = 4096;
+
+// Copies the header out of a mapped file and checks its version.  Returns
+// false for a file this code cannot read.
+inline bool read_blocked_header(const char *map, BlockedHeader &h) {
+  memcpy(&h, map, sizeof h);
+  if (h.magic != BLOCKED_MAGIC || h.version < 1 || h.version > 2 || h.bucket_bytes != 64)
+    return false;
+  if (h.version < 2) { h.kept_partitions = h.taxon_codes; h.taxon_codes = 0; }
+  return true;
+}
+
+inline BlockedLayout blocked_layout(const BlockedHeader &h) {
+  uint64_t K = h.kept_partitions ? h.kept_partitions : 1ULL << h.partition_bits;
+  BlockedLayout L;
+  L.buckets = BLOCKED_HEADER_BYTES;
+  L.stash_off = L.buckets + K * h.buckets_per_partition * 64;
+  L.stash_key = L.stash_off + (K + 1) * 8;
+  L.stash_val = L.stash_key + h.stash_entries * 8;
+  L.code_taxa = L.stash_val + h.stash_entries * 4;
+  L.end = L.code_taxa + (h.version >= 2 ? (h.taxon_codes + 1) * 4 : 0);
+  return L;
+}
 
 struct Geometry {
   int p, q, B, r, v, w, S, sf, H;
@@ -195,6 +228,10 @@ struct Table {
   uint64_t part_base;
   const uint64_t *stash_off, *stash_key;
   const uint32_t *stash_val;
+  // Version 2 slots and the stash hold dense taxon codes, and code_taxa maps
+  // them back to internal taxon IDs (entry 0 is 0).  nullptr for version 1,
+  // whose slots hold internal taxon IDs.
+  const uint32_t *code_taxa;
   Geometry G;
   // How the device scans a bucket: REGS_FULL and REGS_EARLY read it once into
   // registers (see get_blocked_regs) when its geometry has an instantiation,
@@ -225,10 +262,22 @@ struct Table {
     return (lo < stash_off[part + 1] && stash_key[lo] == key) ? stash_val[lo] : 0u;
   }
 
-  // The blocked lookup for a hash: the natives of home, stopping on a match;
-  // then, only if home's spill-filter bit for rem is set, the guests of alt;
-  // then the stash only if alt is full.
-  K2HD uint32_t get_blocked_hash(uint64_t h) const {
+  // Internal taxon ID of a value as stored in a slot or the stash.
+  K2HD uint32_t decode(uint32_t c) const {
+    if (! code_taxa) return c;
+#ifdef __CUDA_ARCH__
+    return __ldg(code_taxa + c);
+#else
+    return code_taxa[c];
+#endif
+  }
+
+  K2HD uint32_t get_blocked_hash(uint64_t h) const { return decode(get_blocked_code(h)); }
+
+  // The blocked lookup for a hash, returning the value as stored: the natives
+  // of home, stopping on a match; then, only if home's spill-filter bit for
+  // rem is set, the guests of alt; then the stash only if alt is full.
+  K2HD uint32_t get_blocked_code(uint64_t h) const {
 #ifdef __CUDA_ARCH__
     // Every geometry the builder makes from the standard value widths; the
     // test is uniform across a launch, so it costs no divergence.
@@ -236,7 +285,8 @@ struct Table {
     if (G.H == gh && G.w == gw && G.S == gs && scan_mode != RELOAD) \
       return scan_mode == REGS_EARLY ? get_blocked_regs<gh, gw, gs, true>(h) \
                                      : get_blocked_regs<gh, gw, gs, false>(h);
-    K2T_GEO(36, 34, 14) K2T_GEO(29, 23, 21) K2T_GEO(26, 27, 18)
+    // (17, 33, 15) is the exact GTDB test table with dense taxon codes.
+    K2T_GEO(36, 34, 14) K2T_GEO(29, 23, 21) K2T_GEO(26, 27, 18) K2T_GEO(17, 33, 15)
 #undef K2T_GEO
 #endif
     uint64_t part = G.part_of(h), home, rem;
@@ -295,7 +345,7 @@ struct Table {
     }
     return val;
   }
-  // get_blocked_hash for a geometry fixed at compile time, with each bucket
+  // get_blocked_code for a geometry fixed at compile time, with each bucket
   // read once as four 16-byte loads instead of 2 to 3 words per slot.
   template<int H, int W, int S, bool EARLY>
   __device__ __forceinline__ uint32_t get_blocked_regs(uint64_t h) const {
@@ -336,6 +386,32 @@ struct Table {
     return kind == BLOCKED ? get_blocked_hash(G.hash(key)) : get_cht(key);
   }
 };
+
+// Points t at the blocked table in a mapped file of size bytes, through the
+// same layout the device copies use.  Returns a message for a file this code
+// cannot read, or nullptr.  A table that keeps only some of its partitions
+// is not supported here.
+inline const char *map_blocked(const char *map, size_t size, Table &t, BlockedHeader &h) {
+  if (! read_blocked_header(map, h)) return "not a version 1 or 2 blocked table";
+  if (h.kept_partitions) return "subsampled blocked tables are not supported";
+  t.kind = Table::BLOCKED;
+  t.G.init(h);
+  if ((uint32_t) t.G.S != h.slots || (uint32_t) t.G.sf != h.spill_bits ||
+      (uint32_t) t.G.B != h.key_bits)
+    return "blocked table header is inconsistent";
+  if (h.version >= 2 && h.taxon_codes >> h.value_bits)
+    return "blocked table has more taxon codes than its value width holds";
+  BlockedLayout L = blocked_layout(h);
+  if (L.end != size) return "blocked table size does not match its header";
+  t.buckets = (const uint8_t *) (map + L.buckets);
+  t.part_base = 0;
+  t.stash_off = (const uint64_t *) (map + L.stash_off);
+  t.stash_key = (const uint64_t *) (map + L.stash_key);
+  t.stash_val = (const uint32_t *) (map + L.stash_val);
+  t.code_taxa = h.version >= 2 ? (const uint32_t *) (map + L.code_taxa) : nullptr;
+  if (t.code_taxa && t.code_taxa[0] != 0) return "blocked table has a nonzero taxon for code 0";
+  return nullptr;
+}
 
 }  // namespace k2t
 

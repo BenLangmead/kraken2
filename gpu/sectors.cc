@@ -96,15 +96,10 @@ int main(int argc, char **argv) {
     cht.kind = k2t::Table::CHT; cht.capacity = hdr[0];
     cht.key_bits = (int) hdr[2]; cht.value_bits = (int) hdr[3];
     cht.cells = (const uint32_t *) (cf.data() + 32); }
-  { k2t::BlockedHeader bh; memcpy(&bh, bf.data(), sizeof bh);
-    if (bh.magic != k2t::BLOCKED_MAGIC) { fprintf(stderr, "%s is not a blocked table\n", argv[3]); return 1; }
-    blk.kind = k2t::Table::BLOCKED; blk.G.init(bh);
-    size_t nbk = (size_t) (blk.G.P * blk.G.nb) * 64;
-    size_t off_o = k2t::BLOCKED_HEADER_BYTES + nbk, off_k = off_o + (blk.G.P + 1) * 8;
-    blk.buckets = (const uint8_t *) (bf.data() + k2t::BLOCKED_HEADER_BYTES);
-    blk.stash_off = (const uint64_t *) (bf.data() + off_o);
-    blk.stash_key = (const uint64_t *) (bf.data() + off_k);
-    blk.stash_val = (const uint32_t *) (bf.data() + off_k + bh.stash_entries * 8); }
+  { k2t::BlockedHeader bh;
+    if (const char *e = k2t::map_blocked(bf.data(), bf.size(), blk, bh)) {
+      fprintf(stderr, "%s: %s\n", argv[3], e); return 1;
+    } }
   const k2t::Geometry &G = blk.G;
 
   FILE *f = fopen(argv[1], "rb");

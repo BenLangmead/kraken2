@@ -11,7 +11,7 @@ agree with it, and each records a measurement taken on an L40S (`g6e`, us-east-1
 | `emul.cc` | host emulation of the fused kernel, minus the CUDA parts | every line identical to classify on 2M reads and 2M pairs, both tables |
 | `kernels.cuh` | the device kernels, shared so the two programs cannot drift | &mdash; |
 | `classify_core.h` | Kraken 2's scanner for mates with ambiguous bases, tree resolution, line formatting | shared by the kernel and `emul.cc` |
-| `table.h` | the table as host and device see it: compact hash or blocked, chosen by magic number | shared by the kernels and `emul.cc` |
+| `table.h` | the table as host and device see it: compact hash or blocked, chosen by magic number; blocked version 1 (internal taxon IDs in slots) or 2 (dense taxon codes, decoded through the code-to-taxon array), but not a subsampled one | shared by the kernels and `emul.cc` |
 | `k2gpu.cu` | end to end: BGZF in (single-end, or interleaved pairs from `k2bgzf in1.fq in2.fq`), one line per read or pair out; can stream a blocked table in groups of partitions | byte-identical to classify with either table, single-end or paired, resident or streamed (10M reads or pairs, L40S) |
 
 `emul.cc` exists because device time is the scarce resource.  Running the

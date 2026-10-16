@@ -144,43 +144,38 @@ int main(int argc, char **argv) {
   uint64_t magic; memcpy(&magic, hmap, 8);
   size_t blk_bucket_off = 0;
   if (magic == k2t::BLOCKED_MAGIC) {
-    k2t::BlockedHeader bh; memcpy(&bh, hmap, sizeof bh);
-    if (bh.version != 1 || bh.bucket_bytes != 64) {
-      fprintf(stderr, "unsupported blocked table version\n"); return 1;
+    k2t::BlockedHeader bh;
+    if (const char *e = k2t::map_blocked(hmap, hst.st_size, h_tab, bh)) {
+      fprintf(stderr, "%s: %s\n", argv[3], e); return 1;
     }
-    h_tab.kind = k2t::Table::BLOCKED;
-    h_tab.G.init(bh);
     // K2GPU_SCAN: 0 reads each bucket into registers once (the default), 1
     // does the same and stops at the first remainder >= the query's, 2 reloads
     // each slot.
     h_tab.scan_mode = env_int("K2GPU_SCAN", k2t::Table::REGS_FULL);
-    if ((uint32_t) h_tab.G.S != bh.slots || (uint32_t) h_tab.G.sf != bh.spill_bits ||
-        (uint32_t) h_tab.G.B != bh.key_bits) {
-      fprintf(stderr, "blocked table header is inconsistent\n"); return 1;
-    }
-    size_t nbk = (size_t) (h_tab.G.P * h_tab.G.nb) * 64;
-    blk_bucket_off = k2t::BLOCKED_HEADER_BYTES;
-    size_t off_o = blk_bucket_off + nbk;
-    size_t off_k = off_o + (h_tab.G.P + 1) * 8;
-    size_t off_v = off_k + bh.stash_entries * 8;
-    h_tab.buckets = (const uint8_t *) (hmap + blk_bucket_off);
-    h_tab.part_base = 0;
-    h_tab.stash_off = (const uint64_t *) (hmap + off_o);
-    h_tab.stash_key = (const uint64_t *) (hmap + off_k);
-    h_tab.stash_val = (const uint32_t *) (hmap + off_v);
+    k2t::BlockedLayout L = k2t::blocked_layout(bh);
+    size_t nbk = L.stash_off - L.buckets;
+    blk_bucket_off = L.buckets;
     d_tab = h_tab;
-    uint64_t *dso, *dsk = nullptr; uint32_t *dsv = nullptr;
+    // The stash and the code-to-taxon array are small and stay resident in
+    // both modes.
+    uint64_t *dso, *dsk = nullptr; uint32_t *dsv = nullptr, *dct = nullptr;
     CK(cudaMalloc(&dso, (h_tab.G.P + 1) * 8));
-    upload(dso, off_o, (h_tab.G.P + 1) * 8);
+    upload(dso, L.stash_off, (h_tab.G.P + 1) * 8);
     if (bh.stash_entries) {
-      CK(cudaMalloc(&dsk, bh.stash_entries * 8)); upload(dsk, off_k, bh.stash_entries * 8);
-      CK(cudaMalloc(&dsv, bh.stash_entries * 4)); upload(dsv, off_v, bh.stash_entries * 4);
+      CK(cudaMalloc(&dsk, bh.stash_entries * 8)); upload(dsk, L.stash_key, bh.stash_entries * 8);
+      CK(cudaMalloc(&dsv, bh.stash_entries * 4)); upload(dsv, L.stash_val, bh.stash_entries * 4);
+    }
+    if (h_tab.code_taxa) {
+      CK(cudaMalloc(&dct, (bh.taxon_codes + 1) * 4));
+      upload(dct, L.code_taxa, (bh.taxon_codes + 1) * 4);
     }
     d_tab.stash_off = dso; d_tab.stash_key = dsk; d_tab.stash_val = dsv;
+    d_tab.code_taxa = dct;
     table_bytes = nbk;
-    printf("table: blocked, %" PRIu64 " partitions of %" PRIu64 " buckets, "
-           "%d slots of %d bits, %d-bit spill filter, stash %" PRIu64 "\n",
-           h_tab.G.P, h_tab.G.nb, h_tab.G.S, h_tab.G.w, h_tab.G.sf, bh.stash_entries);
+    printf("table: blocked version %u, %" PRIu64 " partitions of %" PRIu64 " buckets, "
+           "%d slots of %d bits, %d-bit spill filter, stash %" PRIu64 ", %" PRIu64
+           " taxon codes\n", bh.version, h_tab.G.P, h_tab.G.nb, h_tab.G.S, h_tab.G.w,
+           h_tab.G.sf, bh.stash_entries, bh.taxon_codes);
   } else {
     uint64_t hdr[4]; memcpy(hdr, hmap, sizeof hdr);
     h_tab.kind = k2t::Table::CHT;
@@ -200,7 +195,7 @@ int main(int argc, char **argv) {
   if (streamed) {
     if (h_tab.kind != k2t::Table::BLOCKED || h_tab.G.P % n_groups != 0 || h_tab.G.v > 16) {
       fprintf(stderr, "streaming needs a blocked table whose partition count is a multiple "
-              "of K2GPU_GROUPS and whose values fit 16 bits\n");
+              "of K2GPU_GROUPS and whose stored values fit 16 bits\n");
       return 1;
     }
     uint8_t *hb; CK(cudaHostAlloc(&hb, table_bytes, cudaHostAllocDefault));
