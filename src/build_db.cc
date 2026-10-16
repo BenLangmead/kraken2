@@ -58,6 +58,7 @@ int main(int argc, char **argv) {
   opts.blocked_partition_bits = 8;
   opts.blocked_load = 0.9;
   opts.blocked_remainder_bits = 0;
+  opts.blocked_kept_partitions = 0;
   ParseCommandLine(argc, argv, opts);
 
   omp_set_num_threads( opts.num_threads );
@@ -189,7 +190,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
   int opt;
   long long sig;
 
-  while ((opt = getopt(argc, argv, "?hB:b:c:FH:m:n:o:t:k:l:M:p:r:s:S:T:XC:YP:e:R:")) != -1) {
+  while ((opt = getopt(argc, argv, "?hB:b:c:FH:m:n:o:t:k:l:M:p:r:s:S:T:XC:YP:e:R:K:")) != -1) {
     switch (opt) {
       case 'h' : case '?' :
         usage(0);
@@ -294,6 +295,12 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
           errx(EX_USAGE, "blocked table remainder bits must be between 1 and 46");
         opts.blocked_remainder_bits = sig;
         break;
+      case 'K' :
+        sig = atoll(optarg);
+        if (sig < 1)
+          errx(EX_USAGE, "blocked table kept partitions must be positive");
+        opts.blocked_kept_partitions = sig;
+        break;
       case 'C':
         sig = atoll(optarg);
         if (sig != 32 && sig != 40)
@@ -369,7 +376,10 @@ void usage(int exit_code) {
        << "  -e FLOAT      Blocked table slot load (default: 0.9)\n"
        << "  -R INT        Blocked table remainder bits; below the exact width,\n"
        << "                keys are stored as fingerprints and lookups can return\n"
-       << "                false positives (default: exact)" << endl;
+       << "                false positives (default: exact)\n"
+       << "  -K INT        Blocked table: keep only the first INT partitions, a\n"
+       << "                fraction INT / 2^P of minimizer hash space; lookups\n"
+       << "                of the rest miss (default: all)" << endl;
   exit(exit_code);
 }
 
@@ -387,7 +397,8 @@ void BuildBlockedTable(const Taxonomy &taxonomy,
       (opts.spaced_seed_mask & lmer_mask) : lmer_mask;
   BlockedTableBuilder builder(pext_mask, opts.blocked_partition_bits,
                               opts.blocked_load, taxonomy,
-                              opts.blocked_remainder_bits);
+                              opts.blocked_remainder_bits,
+                              opts.blocked_kept_partitions);
   int threads = opts.num_threads;
   vector<BlockedTableBuilder::Buffer *> buffers(threads);
   for (int t = 0; t < threads; t++)
