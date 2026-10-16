@@ -612,7 +612,7 @@ int main(int argc, char **argv) {
 
     for (size_t bt = 0; bt + 1 < batch_first.size(); bt++) {
       size_t i0 = batch_first[bt], i1 = batch_first[bt + 1];
-      uint64_t R0 = rec0(i0), U0 = R0 / mates;
+      uint64_t R0 = rec0(i0);
       uint64_t brecs = rec0(i1 - 1) + nrec(i1 - 1) - R0, bunits = brecs / mates;
       uint64_t uoff0 = ent[chunk_b0[i0]].uoff;
       auto bptrs = [&](size_t i, char *&ub, uint32_t *&o, uint32_t *&ln, uint32_t *&ho, uint32_t *&hl) {
@@ -753,7 +753,6 @@ int main(int argc, char **argv) {
       finalize(i1 - 1, set[(i1 - 1) % 2]);
       CK(cudaDeviceSynchronize());
       t_fin += now_s() - tf;
-      (void) U0; (void) bunits;
     }
   }
   CK(cudaDeviceSynchronize());
