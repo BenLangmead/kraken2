@@ -196,6 +196,11 @@ struct Table {
   const uint64_t *stash_off, *stash_key;
   const uint32_t *stash_val;
   Geometry G;
+  // How the device scans a bucket: REGS_FULL and REGS_EARLY read it once into
+  // registers (see get_blocked_regs) when its geometry has an instantiation,
+  // and RELOAD reads each slot with ld64.  The host always uses scan().
+  enum ScanMode { REGS_FULL = 0, REGS_EARLY = 1, RELOAD = 2 };
+  int scan_mode;
 
   // Taxon in the slot of [lo, hi) whose remainder is rem, or 0.  Each slot is
   // read with an 8-byte load that stays inside its 64-byte bucket.
@@ -224,6 +229,16 @@ struct Table {
   // then, only if home's spill-filter bit for rem is set, the guests of alt;
   // then the stash only if alt is full.
   K2HD uint32_t get_blocked_hash(uint64_t h) const {
+#ifdef __CUDA_ARCH__
+    // Every geometry the builder makes from the standard value widths; the
+    // test is uniform across a launch, so it costs no divergence.
+#define K2T_GEO(gh, gw, gs) \
+    if (G.H == gh && G.w == gw && G.S == gs && scan_mode != RELOAD) \
+      return scan_mode == REGS_EARLY ? get_blocked_regs<gh, gw, gs, true>(h) \
+                                     : get_blocked_regs<gh, gw, gs, false>(h);
+    K2T_GEO(36, 34, 14) K2T_GEO(29, 23, 21) K2T_GEO(26, 27, 18)
+#undef K2T_GEO
+#endif
     uint64_t part = G.part_of(h), home, rem;
     G.locate(h, home, rem);
     const uint8_t *base = buckets + (((part - part_base) * G.nb) << 6);
@@ -240,6 +255,67 @@ struct Table {
     if (! v && hi == (unsigned) G.S && stash_off) v = stash_find(part, home, rem);
     return v;
   }
+
+#ifdef __CUDACC__
+  // Bits [H + i * W, H + (i + 1) * W) of a bucket held in 16 registers.  The
+  // word indices and shifts are constants once the loop over slots unrolls.
+  template<int H, int W>
+  __device__ __forceinline__ static uint64_t reg_slot(const uint32_t (&w)[16], int i) {
+    const int off = H + i * W, j = off >> 5, s = off & 31;
+    uint64_t x = (uint64_t) w[j] | ((uint64_t) w[j + 1 < 16 ? j + 1 : 15] << 32);
+    x >>= s;
+    if (s && s + W > 64 && j + 2 < 16) x |= (uint64_t) w[j + 2] << (64 - s);
+    return x;
+  }
+  __device__ __forceinline__ static void load_bucket(const uint8_t *b, uint32_t (&w)[16]) {
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+      uint4 u = __ldg((const uint4 *) b + k);
+      w[4 * k] = u.x; w[4 * k + 1] = u.y; w[4 * k + 2] = u.z; w[4 * k + 3] = u.w;
+    }
+  }
+  // Taxon in the slot of [lo, hi) whose remainder is rem, or 0.  Without
+  // EARLY every slot is compared without branches; with EARLY the scan stops
+  // at the first remainder >= rem, since each run of slots is sorted.
+  template<int H, int W, int S, bool EARLY>
+  __device__ __forceinline__ uint32_t scan_regs(const uint32_t (&w)[16], unsigned lo, unsigned hi,
+                                                uint64_t rem) const {
+    uint32_t val = 0;
+    #pragma unroll
+    for (int i = 0; i < S; i++) {
+      uint64_t x = reg_slot<H, W>(w, i), xr = x & G.rmask;
+      if (EARLY) {
+        if ((unsigned) i >= hi) break;
+        if ((unsigned) i < lo) continue;
+        if (xr >= rem) { if (xr == rem) val = (uint32_t) ((x >> G.r) & G.vmask); break; }
+      } else {
+        bool m = (unsigned) i >= lo && (unsigned) i < hi && xr == rem;
+        val = m ? (uint32_t) ((x >> G.r) & G.vmask) : val;
+      }
+    }
+    return val;
+  }
+  // get_blocked_hash for a geometry fixed at compile time, with each bucket
+  // read once as four 16-byte loads instead of 2 to 3 words per slot.
+  template<int H, int W, int S, bool EARLY>
+  __device__ __forceinline__ uint32_t get_blocked_regs(uint64_t h) const {
+    uint64_t part = G.part_of(h), home, rem;
+    G.locate(h, home, rem);
+    const uint8_t *base = buckets + (((part - part_base) * G.nb) << 6);
+    uint32_t w[16];
+    load_bucket(base + (home << 6), w);
+    uint32_t v = scan_regs<H, W, S, EARLY>(w, 0, w[0] & 127, rem);
+    if (v) return v;
+    unsigned bit = COUNT_BITS + G.spill_bit(rem);
+    unsigned sp = bit < 32 ? (w[0] >> bit) & 1 : (w[1] >> (bit - 32)) & 1;
+    if (! sp) return 0;
+    load_bucket(base + (G.alt(home, rem) << 6), w);
+    unsigned lo = w[0] & 127, hi = (w[0] >> 7) & 127;
+    v = scan_regs<H, W, S, EARLY>(w, lo, hi, rem);
+    if (! v && hi == (unsigned) S && stash_off) v = stash_find(part, home, rem);
+    return v;
+  }
+#endif
 
   K2HD uint32_t get_cht(uint64_t key) const {
     uint64_t hc = murmur(key);

@@ -150,6 +150,10 @@ int main(int argc, char **argv) {
     }
     h_tab.kind = k2t::Table::BLOCKED;
     h_tab.G.init(bh);
+    // K2GPU_SCAN: 0 reads each bucket into registers once (the default), 1
+    // does the same and stops at the first remainder >= the query's, 2 reloads
+    // each slot.
+    h_tab.scan_mode = env_int("K2GPU_SCAN", k2t::Table::REGS_FULL);
     if ((uint32_t) h_tab.G.S != bh.slots || (uint32_t) h_tab.G.sf != bh.spill_bits ||
         (uint32_t) h_tab.G.B != bh.key_bits) {
       fprintf(stderr, "blocked table header is inconsistent\n"); return 1;
