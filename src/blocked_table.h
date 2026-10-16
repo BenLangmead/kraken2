@@ -22,21 +22,38 @@
 // home can be recovered from (alt, rem), so a key stored in its alt bucket
 // is still unambiguous.
 //
+// Fingerprint mode stores only the low r bits of the remainder, for an r
+// below the exact width, and rem above means those r bits.  Keys with the
+// same (home, rem) become one entry whose taxon is their LCA, so a lookup
+// matches at most one slot, and that slot's taxon is the LCA of every key
+// that maps there.  A minimizer that is not in the table but shares
+// (home, rem) with an entry returns that entry's taxon: a false positive, at
+// about (slots compared) * 2^-r per absent lookup.
+//
 // Bucket (512 bits, little-endian bit order):
 //   bits 0-6    natives: keys whose home is this bucket, stored first
 //   bits 7-13   total: natives plus guests (keys whose alt is this bucket)
 //   bits 14..   spill filter, sf bits: a key stored outside its home bucket
 //               sets bit hash(rem) mod sf in its home bucket's filter
-//   then S slots of w = r + v bits: remainder in the low r bits, taxon above
+//   then S slots of w = r + v bits: remainder in the low r bits, taxon
+//   code above
 // A lookup scans the natives of home and stops on a match.  Otherwise it
 // reads alt only if its own filter bit is set, and scans alt's guests.  Keys
 // that fit in neither bucket go to a sorted per-partition stash, which a
 // lookup searches only when alt is full.  Augmenting placement at build time
 // normally leaves the stash empty.
 //
+// Taxon codes: slots and the stash store a dense code, not the internal
+// taxon ID.  Codes 1..U number the U distinct taxa stored in the table, most
+// frequent first (by entry count, ties by internal taxon ID), so v is the
+// width of U rather than of the whole taxonomy.  Code 0 means "absent".  A
+// lookup decodes the code it finds through the code-to-taxon array.
+//
 // File layout: a BlockedTableHeader padded to 4096 bytes, P * nb buckets,
 // then the stash: P + 1 uint64 offsets, the stash keys (home << r | rem,
-// uint64) and their taxa (uint32).
+// uint64) and their taxon codes (uint32), then the code-to-taxon array, U + 1
+// uint32 with entry 0 = 0.  Version 1 files have no array and store internal
+// taxon IDs directly.
 
 #ifndef KRAKEN2_BLOCKED_TABLE_H_
 #define KRAKEN2_BLOCKED_TABLE_H_
@@ -67,16 +84,17 @@ struct BlockedTableHeader {
   uint32_t bucket_bytes;
   uint32_t partition_bits;      // p
   uint32_t key_bits;            // B
-  uint32_t remainder_bits;      // r
-  uint32_t value_bits;          // v
+  uint32_t remainder_bits;      // r; below the exact width in fingerprint mode
+  uint32_t value_bits;          // v, the width of a taxon code
   uint32_t slots;               // S
   uint32_t spill_bits;          // sf
   uint64_t buckets_per_partition;  // nb
-  uint64_t entries;
+  uint64_t entries;             // stored (home, rem) entries
   uint64_t stash_entries;
   uint64_t pext_mask;
   uint64_t guests;
   uint64_t spilled_buckets;
+  uint64_t taxon_codes;         // U; version 2 and later
 };
 
 namespace blocked {
@@ -185,7 +203,7 @@ struct Geometry {
     part = h >> q;
     unsigned __int128 t = (unsigned __int128) (h & qmask) * nb;
     home = (uint64_t) (t >> q);
-    rem = fd_nb.div((uint64_t) t & qmask);
+    rem = fd_nb.div((uint64_t) t & qmask) & rmask;
   }
   inline uint64_t alt(uint64_t home, uint64_t rem) const {
     uint64_t a = home + 1 + fm_alt.mod(murmur(rem ^ ALT_SALT));
@@ -227,6 +245,7 @@ class BlockedTable : public KeyValueStore {
   const uint64_t *stash_offsets_;
   const uint64_t *stash_keys_;
   const uint32_t *stash_vals_;
+  const uint32_t *code_taxa_;  // code -> internal taxon ID; nullptr in version 1
   char *owned_;            // malloc'ed table bytes, or nullptr when mapped
   size_t owned_bytes_;
   MMapFile backing_file_;
@@ -242,7 +261,9 @@ class BlockedTable : public KeyValueStore {
 
 // Collects (minimizer, taxon) pairs from many threads, reduces duplicates by
 // LCA, and writes the table.  Pairs are grouped by partition as they arrive,
-// so each partition is placed independently.
+// so each partition is placed independently.  remainder_bits of 0 builds an
+// exact table; a positive value is used as r, which gives a fingerprint table
+// when it is below the exact width.
 class BlockedTableBuilder {
   public:
 #pragma pack(push, 1)
@@ -250,7 +271,7 @@ class BlockedTableBuilder {
 #pragma pack(pop)
 
   BlockedTableBuilder(uint64_t pext_mask, int partition_bits, double load,
-                      const Taxonomy &tax);
+                      const Taxonomy &tax, int remainder_bits = 0);
 
   // Per-thread buffer; Add() is not thread-safe, Flush() is.
   class Buffer {
@@ -264,9 +285,11 @@ class BlockedTableBuilder {
     std::vector<std::vector<Rec> > parts_;
   };
 
-  // Places every partition and writes the file.  value_bits must hold every
-  // taxon ID.  Returns the number of distinct keys.
-  uint64_t Write(const char *filename, int value_bits, int threads);
+  // Numbers the stored taxa, places every partition and writes the file.
+  // taxonomy_bits is the width of every internal taxon ID; it is checked and
+  // reported, but slots use the narrower code width.  Returns the number of
+  // distinct minimizers.
+  uint64_t Write(const char *filename, int taxonomy_bits, int threads);
 
   uint64_t pext_mask() const { return pext_mask_; }
 
@@ -277,6 +300,7 @@ class BlockedTableBuilder {
   uint64_t pext_mask_;
   int p_, B_;
   double load_;
+  int remainder_bits_;
   const Taxonomy &tax_;
   blocked::Pext pext_;
   blocked::Mix mix_;
