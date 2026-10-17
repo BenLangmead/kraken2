@@ -10,6 +10,18 @@ add_executable(build_db
         omp_hack.cc
         utilities.cc)
 
+add_executable(bracken_distrib
+        bracken_distrib.cc
+        blocked_table.cc
+        mmap_file.cc
+        compact_hash.cc
+        taxonomy.cc
+        fast_reader.cc
+        bgzf_index.cc
+        mmscanner.cc
+        omp_hack.cc
+        utilities.cc)
+
 add_executable(classify
         classify.cc
         blocked_table.cc
@@ -67,6 +79,7 @@ add_library(tax SHARED
 
 target_link_libraries(build_db ${INFLATE_LIBRARIES})
 target_link_libraries(classify ${INFLATE_LIBRARIES})
+target_link_libraries(bracken_distrib ${INFLATE_LIBRARIES})
 target_link_libraries(estimate_capacity ${INFLATE_LIBRARIES})
 target_link_libraries(k2mask ${INFLATE_LIBRARIES} ${ZLIB_LIBRARIES} Threads::Threads)
 target_link_libraries(blast_to_fasta ${MATH})
