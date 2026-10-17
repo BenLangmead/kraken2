@@ -84,6 +84,12 @@ const int BLOCKED_COUNT_BITS = 14;
 // The 8-byte slot read in the lookup needs w + 7 <= 64.
 const int BLOCKED_MIN_SLOT_BITS = 16;
 const int BLOCKED_MAX_SLOT_BITS = 57;
+// Automatic partition count.  Partitions of fewer keys than this vary
+// enough in size to spill keys into the stash at the default load, and 4,096
+// partitions is what the GPU's partition streaming and the build's parallel
+// placement were measured with.
+const int BLOCKED_AUTO_MAX_BITS = 12;
+const uint64_t BLOCKED_AUTO_MIN_KEYS = 1ULL << 17;
 
 struct BlockedTableHeader {
   uint64_t magic;
@@ -280,6 +286,9 @@ class BlockedTableBuilder {
   struct Rec { uint64_t h; uint32_t taxid; };
 #pragma pack(pop)
 
+  // A negative partition_bits chooses the partition count from the number
+  // of distinct keys: the largest power of two up to 2^BLOCKED_AUTO_MAX_BITS
+  // that leaves each partition at least BLOCKED_AUTO_MIN_KEYS keys.
   BlockedTableBuilder(uint64_t pext_mask, int partition_bits, double load,
                       const Taxonomy &tax, int remainder_bits = 0,
                       uint64_t kept_partitions = 0);
@@ -310,6 +319,7 @@ class BlockedTableBuilder {
 
   uint64_t pext_mask_;
   int p_, B_;
+  bool auto_p_;
   double load_;
   int remainder_bits_;
   uint64_t kept_;

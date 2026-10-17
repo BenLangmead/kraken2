@@ -55,8 +55,8 @@ int main(int argc, char **argv) {
   opts.maximum_capacity = 0;
   opts.deterministic_build = true;
   opts.blocked_table = false;
-  opts.blocked_partition_bits = 8;
-  opts.blocked_load = 0.9;
+  opts.blocked_partition_bits = -1;
+  opts.blocked_load = 0.99;
   opts.blocked_remainder_bits = 0;
   opts.blocked_kept_partitions = 0;
   ParseCommandLine(argc, argv, opts);
@@ -372,14 +372,16 @@ void usage(int exit_code) {
        << "  -C INT        CHT cell size (default: 32)\n"
        << "  -Y            Build a blocked table instead of a compact hash table\n"
        << "                (-c is then not needed)\n"
-       << "  -P INT        Blocked table partition bits (default: 8)\n"
-       << "  -e FLOAT      Blocked table slot load (default: 0.9)\n"
+       << "  -P INT        Blocked table partition bits (default: chosen from the\n"
+       << "                key count, up to 12, keeping at least 2^17 keys per\n"
+       << "                partition)\n"
+       << "  -e FLOAT      Blocked table slot load (default: 0.99)\n"
        << "  -R INT        Blocked table remainder bits; below the exact width,\n"
        << "                keys are stored as fingerprints and lookups can return\n"
        << "                false positives (default: exact)\n"
        << "  -K INT        Blocked table: keep only the first INT partitions, a\n"
        << "                fraction INT / 2^P of minimizer hash space; lookups\n"
-       << "                of the rest miss (default: all)" << endl;
+       << "                of the rest miss (default: all; needs -P)" << endl;
   exit(exit_code);
 }
 

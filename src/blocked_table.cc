@@ -327,10 +327,12 @@ void BlockedTable::GetBatch(const hkey_t *keys, hvalue_t *out, size_t n) const {
 BlockedTableBuilder::BlockedTableBuilder(uint64_t pext_mask, int partition_bits,
                                          double load, const Taxonomy &tax,
                                          int remainder_bits, uint64_t kept_partitions)
-    : pext_mask_(pext_mask), p_(partition_bits), load_(load),
+    : pext_mask_(pext_mask),
+      p_(partition_bits < 0 ? BLOCKED_AUTO_MAX_BITS : partition_bits),
+      auto_p_(partition_bits < 0), load_(load),
       remainder_bits_(remainder_bits), kept_(kept_partitions), tax_(tax),
-      parts_(1ULL << partition_bits), reduced_size_(1ULL << partition_bits, 0),
-      locks_(1ULL << partition_bits) {
+      parts_(1ULL << p_), reduced_size_(1ULL << p_, 0),
+      locks_(1ULL << p_) {
   pext_.init(pext_mask);
   B_ = pext_.width;
   if (B_ > 62 || B_ < p_ + 8)
@@ -339,6 +341,8 @@ BlockedTableBuilder::BlockedTableBuilder(uint64_t pext_mask, int partition_bits,
   mix_.init(B_);
   if (load_ <= 0 || load_ >= 1)
     errx(EX_USAGE, "blocked table load must be between 0 and 1");
+  if (auto_p_ && kept_)
+    errx(EX_USAGE, "keeping some partitions needs an explicit partition count");
   if (kept_ > (1ULL << p_))
     errx(EX_USAGE, "blocked table has only %llu partitions to keep",
          (unsigned long long) (1ULL << p_));
@@ -409,19 +413,46 @@ static inline void set_bits(uint64_t *b, int off, int len, uint64_t val) {
 }
 
 uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int threads) {
-  const uint64_t P = parts_.size();
-  const uint64_t K = kept_ ? kept_ : P;
-  const int q = B_ - p_;
   const int AUGMENT_LIMIT = 2000;  // buckets visited per augmenting search
 
   #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-  for (uint64_t part = 0; part < P; part++) {
+  for (uint64_t part = 0; part < (uint64_t) parts_.size(); part++) {
     Reduce(parts_[part]);
     parts_[part].shrink_to_fit();
   }
   uint64_t N = 0;
-  for (uint64_t part = 0; part < P; part++)
-    N += parts_[part].size();
+  for (auto &v : parts_)
+    N += v.size();
+
+  // With an automatic partition count, pairs were collected at the largest
+  // count; now that N is known, merge runs of 2^d neighbouring partitions.
+  // A partition is the top bits of the hash and each is sorted by hash, so
+  // concatenating neighbours gives exactly the sorted partition the smaller
+  // count would have collected.
+  if (auto_p_) {
+    int p = 0;
+    while (p < p_ && (N >> (p + 1)) >= BLOCKED_AUTO_MIN_KEYS)
+      p++;
+    int d = p_ - p;
+    if (d > 0) {
+      vector<vector<Rec> > merged(1ULL << p);
+      for (uint64_t j = 0; j < merged.size(); j++) {
+        size_t n = 0;
+        for (uint64_t i = j << d; i < (j + 1) << d; i++)
+          n += parts_[i].size();
+        merged[j].reserve(n);
+        for (uint64_t i = j << d; i < (j + 1) << d; i++) {
+          merged[j].insert(merged[j].end(), parts_[i].begin(), parts_[i].end());
+          vector<Rec>().swap(parts_[i]);
+        }
+      }
+      parts_.swap(merged);
+      p_ = p;
+    }
+  }
+  const uint64_t P = parts_.size();
+  const uint64_t K = kept_ ? kept_ : P;
+  const int q = B_ - p_;
   for (uint64_t part = 0; part < P; part++)
     for (auto &rec : parts_[part])
       if (rec.taxid >> taxonomy_bits || rec.taxid >= tax_.node_count())
