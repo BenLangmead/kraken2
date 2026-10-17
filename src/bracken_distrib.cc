@@ -554,7 +554,7 @@ struct Unit {
 };
 
 struct ThreadTimes {
-  double scan = 0, score = 0;
+  double scan = 0, lookup = 0, score = 0;
   uint64_t positions = 0, lookups = 0, runs = 0;
   char pad[64];
 };
@@ -694,9 +694,11 @@ int main(int argc, char **argv) {
           if (slot.size() != npos)
             errx(EX_SOFTWARE, "scanner gave %zu k-mers for %zu positions",
                  slot.size(), npos);
+          double tl = Now();
           vals.resize(keys.size());
           if (! keys.empty())
             hash->GetBatch(keys.data(), vals.data(), keys.size());
+          tt.lookup += Now() - tl;
           runs.Clear();
           for (size_t p = 0; p < npos; p++)
             runs.Push(slot[p] < 0 ? 0 : vals[slot[p]], p);
@@ -751,6 +753,7 @@ int main(int argc, char **argv) {
   ThreadTimes sum;
   for (auto &tt : times) {
     sum.scan += tt.scan;
+    sum.lookup += tt.lookup;
     sum.score += tt.score;
     sum.positions += tt.positions;
     sum.lookups += tt.lookups;
@@ -763,11 +766,12 @@ int main(int argc, char **argv) {
           "bracken_distrib: %llu sequences, %llu bp, %llu positions, "
           "%llu lookups, %llu runs, %zu read lengths\n"
           "  load %.3f s, scan+score %.3f s wall (thread sums: scan+lookup "
-          "%.3f s, window scoring %.3f s), write %.3f s, total %.3f s\n",
+          "%.3f s of which lookup %.3f s, window scoring %.3f s), write %.3f s, "
+          "total %.3f s\n",
           (unsigned long long) n_seqs, (unsigned long long) n_bases,
           (unsigned long long) sum.positions, (unsigned long long) sum.lookups,
           (unsigned long long) sum.runs, nlen,
-          t_loaded - t_start, t_scored - t_loaded, sum.scan, sum.score,
+          t_loaded - t_start, t_scored - t_loaded, sum.scan, sum.lookup, sum.score,
           t_end - t_scored, t_end - t_start);
   delete hash;
   return 0;
