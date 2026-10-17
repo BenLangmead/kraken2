@@ -293,7 +293,8 @@ class BlockedTableBuilder {
                       const Taxonomy &tax, int remainder_bits = 0,
                       uint64_t kept_partitions = 0);
 
-  // Per-thread buffer; Add() is not thread-safe, Flush() is.
+  // Per-thread buffer; Add() is not thread-safe, Flush() is.  Flush() adds
+  // the buffered records without reducing partitions, which Write() does.
   class Buffer {
     public:
     explicit Buffer(BlockedTableBuilder &b);
@@ -314,7 +315,7 @@ class BlockedTableBuilder {
   uint64_t pext_mask() const { return pext_mask_; }
 
   private:
-  void Append(size_t part, std::vector<Rec> &recs);
+  void Append(size_t part, std::vector<Rec> &recs, bool may_reduce = true);
   void Reduce(std::vector<Rec> &v);
   void ReduceTail(std::vector<Rec> &v, size_t from);
   void FinishPartition(size_t part);

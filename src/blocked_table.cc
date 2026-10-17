@@ -372,7 +372,7 @@ void BlockedTableBuilder::Buffer::Add(uint64_t minimizer, uint32_t taxid) {
 void BlockedTableBuilder::Buffer::Flush() {
   for (size_t i = 0; i < parts_.size(); i++)
     if (! parts_[i].empty())
-      builder_.Append(i, parts_[i]);
+      builder_.Append(i, parts_[i], false);
 }
 
 // Sorts by hash and merges duplicates by LCA.  The result depends only on
@@ -456,8 +456,9 @@ void BlockedTableBuilder::Gather(vector<Rec> &dst, vector<vector<Rec> > &chunks)
 // distinct-key count), the thread that found it takes the run out of the
 // partition and grows or reduces it outside the lock.  Records that arrive
 // meanwhile wait on the pending list and are added before the run goes
-// back.
-void BlockedTableBuilder::Append(size_t part, vector<Rec> &recs) {
+// back.  With may_reduce false the run only grows; a flush adds at most one
+// buffer's records, and Write() reduces every partition anyway.
+void BlockedTableBuilder::Append(size_t part, vector<Rec> &recs, bool may_reduce) {
   vector<Rec> run;
   bool reduce;
   {
@@ -469,7 +470,7 @@ void BlockedTableBuilder::Append(size_t part, vector<Rec> &recs) {
     }
     vector<Rec> &dst = parts_[part];
     const size_t n = dst.size() + recs.size();
-    reduce = n > 2 * std::max(reduced_size_[part], (size_t) 1 << 20);
+    reduce = may_reduce && n > 2 * std::max(reduced_size_[part], (size_t) 1 << 20);
     if (! reduce && n <= dst.capacity()) {
       dst.insert(dst.end(), recs.begin(), recs.end());
       recs.clear();
