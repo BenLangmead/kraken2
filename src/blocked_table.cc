@@ -4,6 +4,9 @@
  * This file is part of the Kraken 2 taxonomic sequence classification system.
  */
 
+#ifdef __linux__
+#include <malloc.h>
+#endif
 #include "blocked_table.h"
 #include "compact_hash.h"
 
@@ -334,6 +337,14 @@ BlockedTableBuilder::BlockedTableBuilder(uint64_t pext_mask, int partition_bits,
       p0_(p_), runs_(1ULL << p_), parts_(1ULL << p_), pending_(1ULL << p_),
       busy_(1ULL << p_, 0), locks_(1ULL << p_) {
   pext_.init(pext_mask);
+#ifdef __GLIBC__
+  // Packed runs and tails are reallocated, slightly larger, at every merge.
+  // glibc raises its mmap threshold each time a mapped block is freed, after
+  // which these buffers come from the heap and fragment it until freed
+  // memory can no longer be reused.  A fixed threshold keeps them mapped, so
+  // freeing one returns it to the system.
+  mallopt(M_MMAP_THRESHOLD, 1 << 20);
+#endif
   tax_bits_ = 1;
   while (tax_.node_count() - 1 >> tax_bits_)
     tax_bits_++;
