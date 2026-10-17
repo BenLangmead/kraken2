@@ -331,9 +331,19 @@ BlockedTableBuilder::BlockedTableBuilder(uint64_t pext_mask, int partition_bits,
       p_(partition_bits < 0 ? BLOCKED_AUTO_MAX_BITS : partition_bits),
       auto_p_(partition_bits < 0), load_(load),
       remainder_bits_(remainder_bits), kept_(kept_partitions), tax_(tax),
-      parts_(1ULL << p_), pending_(1ULL << p_), reduced_size_(1ULL << p_, 0),
+      p0_(p_), runs_(1ULL << p_), parts_(1ULL << p_), pending_(1ULL << p_),
       busy_(1ULL << p_, 0), locks_(1ULL << p_) {
   pext_.init(pext_mask);
+  tax_bits_ = 1;
+  while (tax_.node_count() - 1 >> tax_bits_)
+    tax_bits_++;
+  // A tail may grow to a sixteenth of its run before it is merged; the
+  // environment variable sets the shift for experiments.
+  const char *ts = getenv("K2_BLOCKED_TAIL_SHIFT");
+  tail_shift_ = ts ? atoi(ts) : 4;
+  // Per-thread buffers hold about 2^22 records in all, at most 4,096 per
+  // partition.
+  buf_recs_ = std::min((size_t) 4096, std::max((size_t) 256, ((size_t) 1 << 22) >> p_));
   B_ = pext_.width;
   if (B_ > 62 || B_ < p_ + 8)
     errx(EX_SOFTWARE, "blocked table needs between %d and 62 key bits, not %d",
@@ -365,7 +375,7 @@ void BlockedTableBuilder::Buffer::Add(uint64_t minimizer, uint32_t taxid) {
   rec.h = h;
   rec.taxid = taxid;
   parts_[part].push_back(rec);
-  if (parts_[part].size() >= 4096)
+  if (parts_[part].size() >= builder_.buf_recs_)
     builder_.Append(part, parts_[part]);
 }
 
@@ -397,41 +407,209 @@ void BlockedTableBuilder::ReduceTail(vector<Rec> &v, size_t from) {
   v.resize(o);
 }
 
-// Finishes a partition after the scan.  Its first reduced_size_ records are
-// what its last reduction left, sorted and distinct, so only the records
-// appended since are reduced, and the two runs are merged by LCA into a
-// vector of exactly the result's size.  The result is what Reduce would give.
-void BlockedTableBuilder::FinishPartition(size_t part) {
+namespace {
+// Bit packing for PackedRun, least significant bit first.
+struct BitWriter {
+  vector<uint64_t> &w;
+  uint64_t cur = 0;
+  int used = 0;
+  explicit BitWriter(vector<uint64_t> &words) : w(words) {}
+  // v < 2^n, n <= 64.
+  inline void put(uint64_t v, int n) {
+    if (n == 0)
+      return;
+    cur |= v << used;
+    if (used + n >= 64) {
+      w.push_back(cur);
+      int spill = used + n - 64;
+      cur = spill ? v >> (64 - used) : 0;
+      used = spill;
+    }
+    else
+      used += n;
+  }
+  // q zeros, then a one.
+  inline void put_unary(uint64_t q) {
+    while (q >= 63) {
+      put(0, 63);
+      q -= 63;
+    }
+    put(1ULL << q, (int) q + 1);
+  }
+  void finish() {
+    if (used)
+      w.push_back(cur);
+  }
+};
+
+struct BitReader {
+  const uint64_t *w;
+  size_t i = 0;
+  int used = 0;
+  explicit BitReader(const uint64_t *words) : w(words) {}
+  inline uint64_t get(int n) {
+    if (n == 0)
+      return 0;
+    uint64_t v = w[i] >> used;
+    int avail = 64 - used;
+    if (n < avail) {
+      used += n;
+      return v & ((1ULL << n) - 1);
+    }
+    i++;
+    int rest = n - avail;
+    if (rest)
+      v |= (w[i] & ((1ULL << rest) - 1)) << avail;
+    used = rest;
+    return n == 64 ? v : v & ((1ULL << n) - 1);
+  }
+  inline uint64_t get_unary() {
+    uint64_t q = 0;
+    while (true) {
+      uint64_t x = w[i] >> used;
+      if (x) {
+        int z = __builtin_ctzll(x);
+        q += z;
+        used += z + 1;
+        if (used == 64) {
+          i++;
+          used = 0;
+        }
+        return q;
+      }
+      q += 64 - used;
+      i++;
+      used = 0;
+    }
+  }
+};
+
+// Rice parameter for n keys spread over 2^q values: about log2 of the mean
+// gap, so each gap costs k bits plus a short unary quotient.
+inline int rice_k(int q, uint64_t n) {
+  int k = q;
+  while (k > 0 && (n >> (q - k)) > 0)
+    k--;
+  return k;
+}
+}
+
+size_t BlockedTableBuilder::TailLimit(size_t part) const {
+  return std::max((size_t) (runs_[part].n >> tail_shift_), (size_t) 1 << 14);
+}
+
+// recs are sorted by hash and distinct.  The merged run is written into a
+// buffer reserved for its worst case: at most n (k + tax_bits_) bits of
+// remainders and taxa, plus unary quotients that sum to under 3n bits since
+// the gaps sum to under 2^q.  With taxonomy_bits >= 0 every taxon is checked.
+void BlockedTableBuilder::MergeIntoRun(size_t part, const vector<Rec> &recs,
+                                       int taxonomy_bits) {
+  PackedRun &old = runs_[part];
+  const int q = B_ - p0_;
+  const uint64_t qmask = (1ULL << q) - 1;
+  const uint64_t n_est = old.n + recs.size();
+  PackedRun out;
+  out.k = rice_k(q, n_est);
+  const uint64_t kmask = (1ULL << out.k) - 1;
+  out.words.reserve((n_est * (out.k + tax_bits_ + 3)) / 64 + 2);
+  BitWriter bw(out.words);
+  BitReader br(old.words.data());
+  uint64_t prev = 0, n = 0;
+  auto emit = [&](uint64_t low, uint32_t t) {
+    if (t >> tax_bits_ || (taxonomy_bits >= 0 &&
+                           (t >> taxonomy_bits || t >= tax_.node_count())))
+      errx(EX_SOFTWARE, "taxon %u does not fit in %d bits", t,
+           taxonomy_bits >= 0 ? taxonomy_bits : tax_bits_);
+    uint64_t gap = low - prev;
+    prev = low;
+    bw.put_unary(gap >> out.k);
+    bw.put(gap & kmask, out.k);
+    bw.put(t, tax_bits_);
+    n++;
+  };
+  uint64_t a_left = old.n, a_low = 0, a_prev = 0;
+  uint32_t a_tax = 0;
+  const uint64_t old_kmask = (1ULL << old.k) - 1;
+  auto next_a = [&]() {
+    uint64_t g = br.get_unary() << old.k;
+    g |= br.get(old.k) & old_kmask;
+    a_low = a_prev + g;
+    a_prev = a_low;
+    a_tax = (uint32_t) br.get(tax_bits_);
+    a_left--;
+  };
+  bool has_a = a_left > 0;
+  if (has_a)
+    next_a();
+  size_t j = 0;
+  while (has_a || j < recs.size()) {
+    uint64_t b_low = j < recs.size() ? recs[j].h & qmask : 0;
+    if (j == recs.size() || (has_a && a_low < b_low)) {
+      emit(a_low, a_tax);
+      has_a = a_left > 0;
+      if (has_a)
+        next_a();
+    }
+    else if (! has_a || b_low < a_low) {
+      emit(b_low, recs[j].taxid);
+      j++;
+    }
+    else {
+      emit(a_low, (uint32_t) tax_.LowestCommonAncestor(a_tax, recs[j].taxid));
+      j++;
+      has_a = a_left > 0;
+      if (has_a)
+        next_a();
+    }
+  }
+  bw.finish();
+  out.n = n;
+  old = std::move(out);
+}
+
+void BlockedTableBuilder::DecodeRun(size_t part, vector<Rec> &out) const {
+  const PackedRun &run = runs_[part];
+  const int q = B_ - p0_;
+  const uint64_t base = (uint64_t) part << q;
+  const uint64_t kmask = (1ULL << run.k) - 1;
+  BitReader br(run.words.data());
+  uint64_t low = 0;
+  for (uint64_t i = 0; i < run.n; i++) {
+    uint64_t g = br.get_unary() << run.k;
+    g |= br.get(run.k) & kmask;
+    low += g;
+    Rec rec;
+    rec.h = base | low;
+    rec.taxid = (uint32_t) br.get(tax_bits_);
+    out.push_back(rec);
+  }
+}
+
+void BlockedTableBuilder::DecodePartition(uint64_t part, vector<Rec> &out) const {
+  const int d = p0_ - p_;
+  size_t n = out.size();
+  for (uint64_t i = part << d; i < (part + 1) << d; i++)
+    n += runs_[i].n;
+  out.reserve(n);
+  for (uint64_t i = part << d; i < (part + 1) << d; i++)
+    DecodeRun(i, out);
+}
+
+void BlockedTableBuilder::FreePartition(uint64_t part) {
+  const int d = p0_ - p_;
+  for (uint64_t i = part << d; i < (part + 1) << d; i++)
+    runs_[i] = PackedRun();
+}
+
+// Finishes a partition after the scan: the tail and any pending buffers
+// are reduced and merged into the packed run, whose records are then what
+// Reduce would give for every record the partition received.
+void BlockedTableBuilder::FinishPartition(size_t part, int taxonomy_bits) {
   vector<Rec> &v = parts_[part];
   Gather(v, pending_[part]);
-  const size_t a = std::min(reduced_size_[part], v.size());
-  ReduceTail(v, a);
-  const size_t m = v.size();
-  size_t n = 0;
-  for (size_t i = 0, j = a; i < a || j < m; n++) {
-    if (j == m || (i < a && v[i].h < v[j].h))
-      i++;
-    else if (i == a || v[j].h < v[i].h)
-      j++;
-    else {
-      i++;
-      j++;
-    }
-  }
-  vector<Rec> out;
-  out.reserve(n);
-  for (size_t i = 0, j = a; i < a || j < m; ) {
-    if (j == m || (i < a && v[i].h < v[j].h))
-      out.push_back(v[i++]);
-    else if (i == a || v[j].h < v[i].h)
-      out.push_back(v[j++]);
-    else {
-      Rec rec = v[i++];
-      rec.taxid = (uint32_t) tax_.LowestCommonAncestor(rec.taxid, v[j++].taxid);
-      out.push_back(rec);
-    }
-  }
-  v.swap(out);
+  Reduce(v);
+  MergeIntoRun(part, v, taxonomy_bits);
+  vector<Rec>().swap(v);
 }
 
 // Appends the chunks to dst, freeing each one as it is copied.  dst grows
@@ -449,15 +627,16 @@ void BlockedTableBuilder::Gather(vector<Rec> &dst, vector<vector<Rec> > &chunks)
   chunks.clear();
 }
 
-// Adds the buffer's records to the partition and leaves recs empty.  Only
-// short steps happen under the partition's lock: a copy into spare capacity,
-// or moving recs onto the pending list.  When the partition must grow, or
-// has doubled since its last reduction (which keeps memory near the
-// distinct-key count), the thread that found it takes the run out of the
-// partition and grows or reduces it outside the lock.  Records that arrive
-// meanwhile wait on the pending list and are added before the run goes
-// back.  With may_reduce false the run only grows; a flush adds at most one
-// buffer's records, and Write() reduces every partition anyway.
+// Adds the buffer's records to the partition's tail and leaves recs empty.
+// Only short steps happen under the partition's lock: a copy into spare
+// capacity, or moving recs onto the pending list.  When the tail must grow,
+// or has outgrown TailLimit (which keeps raw records a small fraction of the
+// packed ones), the thread that found it takes the tail out of the
+// partition and grows it, or reduces it and merges it into the packed run,
+// outside the lock.  Records that arrive meanwhile wait on the pending list
+// and become the new tail.  With may_reduce false the tail only grows; a
+// flush adds at most one buffer's records, and Write() merges every tail
+// anyway.
 void BlockedTableBuilder::Append(size_t part, vector<Rec> &recs, bool may_reduce) {
   vector<Rec> run;
   bool reduce;
@@ -470,7 +649,7 @@ void BlockedTableBuilder::Append(size_t part, vector<Rec> &recs, bool may_reduce
     }
     vector<Rec> &dst = parts_[part];
     const size_t n = dst.size() + recs.size();
-    reduce = may_reduce && n > 2 * std::max(reduced_size_[part], (size_t) 1 << 20);
+    reduce = may_reduce && n > TailLimit(part);
     if (! reduce && n <= dst.capacity()) {
       dst.insert(dst.end(), recs.begin(), recs.end());
       recs.clear();
@@ -481,17 +660,17 @@ void BlockedTableBuilder::Append(size_t part, vector<Rec> &recs, bool may_reduce
   }
   run.insert(run.end(), recs.begin(), recs.end());
   recs.clear();
-  if (reduce)
+  if (reduce) {
     Reduce(run);
-  const size_t reduced = run.size();
+    MergeIntoRun(part, run, -1);
+    vector<Rec>().swap(run);
+  }
   vector<vector<Rec> > chunks;
   while (true) {
     {
       std::lock_guard<std::mutex> g(locks_[part]);
       if (pending_[part].empty()) {
         parts_[part].swap(run);
-        if (reduce)
-          reduced_size_[part] = reduced;
         busy_[part] = 0;
         return;
       }
@@ -558,50 +737,34 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
   StageClock clock;
 
   // Every stored taxon must fit in taxonomy_bits; the merge below changes no
-  // taxon, so the reduced partitions are checked here.
+  // taxon, so FinishPartition checks each reduced record as it packs it.
   #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-  for (uint64_t part = 0; part < (uint64_t) parts_.size(); part++) {
-    FinishPartition(part);
-    for (auto &rec : parts_[part])
-      if (rec.taxid >> taxonomy_bits || rec.taxid >= tax_.node_count())
-        errx(EX_SOFTWARE, "taxon %u does not fit in %d bits", rec.taxid, taxonomy_bits);
-  }
+  for (uint64_t part = 0; part < (uint64_t) runs_.size(); part++)
+    FinishPartition(part, taxonomy_bits);
   clock.mark("final reduce");
-  uint64_t N = 0;
-  for (auto &v : parts_)
-    N += v.size();
+  uint64_t N = 0, packed_bytes = 0;
+  for (auto &run : runs_) {
+    N += run.n;
+    packed_bytes += run.words.capacity() * sizeof(uint64_t);
+  }
+  if (clock.on)
+    fprintf(stderr, "[blocked times]   %llu keys packed in %.3f GB, %.2f bytes per key\n",
+            (unsigned long long) N, packed_bytes / 1e9, N ? (double) packed_bytes / N : 0.0);
 
   // With an automatic partition count, pairs were collected at the largest
-  // count; now that N is known, merge runs of 2^d neighbouring partitions.
-  // A partition is the top bits of the hash and each is sorted by hash, so
-  // concatenating neighbours gives exactly the sorted partition the smaller
-  // count would have collected.
+  // count; now that N is known, place at a smaller count p_, where each
+  // partition spans 2^(p0_ - p_) neighbouring collected partitions.  A
+  // partition is the top bits of the hash and each run is sorted by hash, so
+  // decoding neighbours in order gives exactly the sorted partition the
+  // smaller count would have collected (DecodePartition).
   if (auto_p_) {
     int p = 0;
     while (p < p_ && (N >> (p + 1)) >= BLOCKED_AUTO_MIN_KEYS)
       p++;
-    int d = p_ - p;
-    if (d > 0) {
-      // A merged partition holds fewer than 2 * BLOCKED_AUTO_MIN_KEYS keys,
-      // so merging in parallel adds little memory.
-      vector<vector<Rec> > merged(1ULL << p);
-      #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-      for (uint64_t j = 0; j < merged.size(); j++) {
-        size_t n = 0;
-        for (uint64_t i = j << d; i < (j + 1) << d; i++)
-          n += parts_[i].size();
-        merged[j].reserve(n);
-        for (uint64_t i = j << d; i < (j + 1) << d; i++) {
-          merged[j].insert(merged[j].end(), parts_[i].begin(), parts_[i].end());
-          vector<Rec>().swap(parts_[i]);
-        }
-      }
-      parts_.swap(merged);
-      p_ = p;
-    }
+    p_ = p;
   }
   clock.mark("key count, merge");
-  const uint64_t P = parts_.size();
+  const uint64_t P = 1ULL << p_;
   const uint64_t K = kept_ ? kept_ : P;
   const int q = B_ - p_;
 
@@ -611,10 +774,9 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
   // already sorted and distinct.  In fingerprint mode rem is the low r bits
   // of the offset, so the entries are sorted and those with the same key
   // merged by LCA; ex then gets the taxon each record's lookup must return.
-  auto make_entries = [&](uint64_t part, int r, uint64_t nb, bool exact,
+  auto make_entries = [&](const vector<Rec> &recs, int r, uint64_t nb, bool exact,
                           vector<pair<uint64_t, uint32_t> > &e,
                           vector<uint32_t> *ex) {
-    const vector<Rec> &recs = parts_[part];
     const uint64_t qmask = (1ULL << q) - 1, rmask = (1ULL << r) - 1;
     e.resize(recs.size());
     for (size_t i = 0; i < recs.size(); i++) {
@@ -661,14 +823,17 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     {
       vector<uint64_t> c(nodes, 0);
       vector<pair<uint64_t, uint32_t> > e;
+      vector<Rec> recs;
       #pragma omp for schedule(dynamic, 1) nowait
       for (uint64_t part = 0; part < K; part++) {
+        recs.clear();
+        DecodePartition(part, recs);
         if (exact) {
-          for (auto &rec : parts_[part])
+          for (auto &rec : recs)
             c[rec.taxid]++;
         }
         else {
-          make_entries(part, r, nb, false, e, nullptr);
+          make_entries(recs, r, nb, false, e, nullptr);
           for (auto &x : e)
             c[x.second]++;
         }
@@ -792,8 +957,8 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     errx(EX_IOERR, "%s %s", what, filename);
   };
   uint64_t kept_keys = 0;
-  for (uint64_t part = 0; part < K; part++)
-    kept_keys += parts_[part].size();
+  for (uint64_t i = 0; i < K << (p0_ - p_); i++)
+    kept_keys += runs_[i].n;
   clock.mark("codes, open");
 
   vector<vector<uint64_t> > stash_keys(K);
@@ -827,7 +992,9 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     // LCA of every record sharing its (home, rem).
     vector<pair<uint64_t, uint32_t> > e;
     vector<uint32_t> expect;
-    make_entries(part, r, nb, exact, e, exact ? nullptr : &expect);
+    vector<Rec> recs;
+    DecodePartition(part, recs);
+    make_entries(recs, r, nb, exact, e, exact ? nullptr : &expect);
     for (auto &x : e)
       x.second = taxon_code[x.second];
     stored[part] = e.size();
@@ -1043,7 +1210,6 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
       T.stash_vals_ = stash_vals[part].data();
       T.code_taxa_ = code_taxa.data();
       T.Init();
-      const vector<Rec> &recs = parts_[part];
       for (size_t i = 0; i < recs.size(); i++)
         bad += T.GetByHash(recs[i].h) != (exact ? recs[i].taxid : expect[i]);
       // Records whose own taxon differs from the LCA they now share.
@@ -1054,7 +1220,8 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     if (! pwrite_fully(fd, buckets.data(), part_bytes,
                        (off_t) (BLOCKED_TABLE_HEADER_BYTES + part * part_bytes)))
       write_failed = 1;
-    vector<Rec>().swap(parts_[part]);
+    vector<Rec>().swap(recs);
+    FreePartition(part);
     step(7);
   }
   }
@@ -1098,9 +1265,11 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     T.Init();
     #pragma omp parallel for schedule(dynamic, 1) reduction(+:bad) num_threads(threads)
     for (uint64_t part = K; part < P; part++) {
-      for (auto &rec : parts_[part])
+      vector<Rec> recs;
+      DecodePartition(part, recs);
+      for (auto &rec : recs)
         bad += T.GetByHash(rec.h) != 0;
-      vector<Rec>().swap(parts_[part]);
+      FreePartition(part);
     }
   }
   if (bad) {

@@ -315,11 +315,30 @@ class BlockedTableBuilder {
   uint64_t pext_mask() const { return pext_mask_; }
 
   private:
+  // A partition's reduced records, sorted by hash and distinct, packed as
+  // the Rice-coded gap between consecutive low q bits of the hash (k bits
+  // of remainder) followed by the internal taxon in a fixed width.  Records
+  // cost about the information in the key set, not 12 bytes each.
+  struct PackedRun {
+    std::vector<uint64_t> words;
+    uint64_t n = 0;
+    int k = 0;
+  };
+
   void Append(size_t part, std::vector<Rec> &recs, bool may_reduce = true);
   void Reduce(std::vector<Rec> &v);
   void ReduceTail(std::vector<Rec> &v, size_t from);
-  void FinishPartition(size_t part);
+  void FinishPartition(size_t part, int taxonomy_bits);
   void Gather(std::vector<Rec> &dst, std::vector<std::vector<Rec> > &chunks);
+  // Merges reduced records into the partition's packed run by LCA.
+  void MergeIntoRun(size_t part, const std::vector<Rec> &recs, int taxonomy_bits);
+  // Appends collected partition part's records to out, in hash order.
+  void DecodeRun(size_t part, std::vector<Rec> &out) const;
+  // Appends the records of placement partition part, which spans 2^d
+  // collected partitions after an automatic partition merge.
+  void DecodePartition(uint64_t part, std::vector<Rec> &out) const;
+  void FreePartition(uint64_t part);
+  size_t TailLimit(size_t part) const;
 
   uint64_t pext_mask_;
   int p_, B_;
@@ -330,12 +349,19 @@ class BlockedTableBuilder {
   const Taxonomy &tax_;
   blocked::Pext pext_;
   blocked::Mix mix_;
-  // Each partition's records are one run (parts_).  While a thread grows or
-  // reduces a run outside the lock, buffers for that partition wait on
-  // pending_.
+  // Each collected partition is a packed run of reduced records (runs_)
+  // plus a tail of raw records appended since its last merge (parts_).
+  // When the tail outgrows a sixteenth of the run, a thread reduces it and
+  // merges it into the run outside the lock; buffers for that partition
+  // wait on pending_ meanwhile.  Collection uses p0_ partition bits; an
+  // automatic partition count may place at fewer (p_ <= p0_).
+  int p0_;
+  int tax_bits_;
+  int tail_shift_;
+  size_t buf_recs_;
+  std::vector<PackedRun> runs_;
   std::vector<std::vector<Rec> > parts_;
   std::vector<std::vector<std::vector<Rec> > > pending_;
-  std::vector<size_t> reduced_size_;
   std::vector<char> busy_;
   std::vector<std::mutex> locks_;
 };
