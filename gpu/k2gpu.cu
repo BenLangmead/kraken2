@@ -5,7 +5,12 @@
 // single pipeline, which is the only way to find out what the stage figures add
 // up to in practice: compressed blocks are sent to the card, expanded there,
 // split into reads there, classified there, and only one identifier per read
-// comes back.  The reads themselves never exist in host memory.
+// comes back.  The reads themselves never exist in host memory, with one
+// exception: a unit the kernel cannot handle (a read longer than MAX_LEN, a
+// line longer than its output slot, or more distinct taxa than the kernel
+// counts) is fetched from the device and classified on the host with the
+// same scanner, resolution and formatting code (classify_core.h), and its
+// line is merged into the chunk's output at its place.
 //
 // Correctness is still settled against classify's own output, so a faster
 // pipeline that disagrees is reported as a failure rather than a speed-up.
@@ -31,6 +36,9 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <memory>
+#include <sched.h>
+#include <unordered_map>
 
 #define CK(x) do { cudaError_t e=(x); if (e!=cudaSuccess) { \
   fprintf(stderr,"cuda %s at %d\n",cudaGetErrorString(e),__LINE__); exit(1);} } while(0)
@@ -46,6 +54,64 @@ struct IdxEnt { uint64_t coff, uoff, rec; };
 static double now_s() {
   struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
   return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+// What the host needs to classify a unit the device left to it: the scan
+// parameters, the host view of the table and the taxonomy columns.
+struct HostCtx {
+  k2t::Table tab;
+  int k, l; uint64_t ssm, tog, mahv; int skip_probe;
+  const uint64_t *parent, *extid;
+};
+
+// Classifies one unit as classify does, with the shared scanner, resolution
+// and formatting of classify_core.h, but with no bound on read length, on the
+// number of distinct taxa or on the length of the line.  Every mate goes
+// through k2c::Scanner, which is Kraken 2's own scanner restated, so a mate
+// without ambiguous bases gets the tokens the device's parallel scan would.
+// Returns the call as an external ID and leaves the line in *line.
+static uint32_t classify_host(const HostCtx &c, int mates, const std::string seq[2],
+                              const std::string &hdr, std::vector<uint32_t> &tok,
+                              std::string *line) {
+  tok.clear();
+  for (int m = 0; m < mates; m++) {
+    k2c::Scanner sc;
+    sc.init(c.k, c.l, c.ssm, c.tog);
+    sc.load(seq[m].data(), (int) seq[m].size());
+    uint64_t mz, last_min = ~0ULL; bool amb;
+    uint32_t last_taxon = 0;
+    while (sc.next(&mz, &amb)) {
+      uint32_t taxon;
+      if (amb) taxon = k2c::AMBIG;
+      else if (mz != last_min) {
+        last_min = mz;
+        if (c.mahv && k2t::murmur(mz) < c.mahv) taxon = 0;
+        else taxon = c.skip_probe ? 0u : c.tab.get(mz);
+        last_taxon = taxon;
+      } else taxon = last_taxon;
+      tok.push_back(taxon);
+    }
+    if (mates == 2 && m == 0) tok.push_back(k2c::MATE);
+  }
+  std::unordered_map<uint32_t, uint32_t> cnt;
+  for (uint32_t t : tok) if (t && t < k2c::AMBIG) cnt[t]++;
+  std::vector<uint32_t> tx, ct;
+  for (auto &e : cnt) { tx.push_back(e.first); ct.push_back(e.second); }
+  uint32_t call = k2c::resolve(c.parent, tx.data(), ct.data(), (int) tx.size());
+  if (line) {
+    // A run is at most two 20-digit numbers and three separators, and the
+    // formatter checks the end only between runs, hence the margin.
+    size_t cap = hdr.size() + 256 + (tok.size() + 1) * 48;
+    line->resize(cap);
+    bool over = false;
+    int n = k2c::format_line(&(*line)[0], &(*line)[0] + cap - 64, call, c.extid,
+                             hdr.data(), (uint32_t) hdr.size(), mates == 2,
+                             (uint32_t) seq[0].size(), mates == 2 ? (uint32_t) seq[1].size() : 0u,
+                             tok.data(), (int) tok.size(), &over);
+    if (over) { fprintf(stderr, "host line buffer too small\n"); exit(1); }
+    line->resize(n);
+  }
+  return (uint32_t) (call ? c.extid[call] : 0);
 }
 
 int main(int argc, char **argv) {
@@ -345,6 +411,10 @@ int main(int argc, char **argv) {
     void **h_cptr, **h_uptr; size_t *h_cb, *h_ub; uint64_t *h_buoff, *h_brec; uint32_t *h_last;
     cudaEvent_t staged, sized; bool staged_rec;
     Timer tm[N_T];
+    // Units of the chunk the device left to the host, and where the chunk's
+    // reads and spans are, so the host can fetch them.
+    uint32_t *hunits, *nhost, *h_nhost;
+    const char *c_ubuf; const uint32_t *c_off, *c_len, *c_hoff, *c_hlen;
   } set[2];
   for (Set &S : set) {
     CK(cudaStreamCreate(&S.st));
@@ -377,6 +447,8 @@ int main(int argc, char **argv) {
     CK(cudaEventCreateWithFlags(&S.staged, cudaEventDisableTiming)); S.staged_rec = false;
     CK(cudaEventCreateWithFlags(&S.sized, cudaEventDisableTiming));
     for (auto &t : S.tm) t.init();
+    CK(cudaMalloc(&S.hunits, max_units*4)); CK(cudaMalloc(&S.nhost, 4));
+    CK(cudaHostAlloc(&S.h_nhost, 4, 0));
   }
   uint32_t *d_over;
   CK(cudaMalloc(&d_over, 4)); CK(cudaMemset(d_over, 0, 4));
@@ -421,7 +493,9 @@ int main(int argc, char **argv) {
     if (out_path) CK(cudaHostAlloc(&outbuf[w], out_cap, 0));
     CK(cudaEventCreateWithFlags(&outev[w], cudaEventDisableTiming));
   }
-  struct OutJob { int w; size_t bytes; };
+  // A job writes either a pinned buffer w or, for a chunk the host had a
+  // hand in, its own merged bytes.
+  struct OutJob { int w; size_t bytes; std::shared_ptr<std::vector<char>> data; };
   std::deque<OutJob> wq;
   bool wdone = false;
   double t_read = 0, t_write = 0, t_wait_in = 0, t_wait_out = 0;
@@ -452,15 +526,16 @@ int main(int argc, char **argv) {
         if (wq.empty()) break;
         j = wq.front(); wq.pop_front();
       }
-      CK(cudaEventSynchronize(outev[j.w]));
+      if (j.w >= 0) CK(cudaEventSynchronize(outev[j.w]));
+      const char *src = j.w >= 0 ? outbuf[j.w] : j.data->data();
       double t = now_s();
       for (size_t w = 0; w < j.bytes; ) {
-        ssize_t got = write(out_fd, outbuf[j.w] + w, j.bytes - w);
+        ssize_t got = write(out_fd, src + w, j.bytes - w);
         if (got <= 0) { perror("write"); exit(1); }
         w += got;
       }
       t_write += now_s() - t;
-      { std::lock_guard<std::mutex> lk(mu); out_bytes += j.bytes; out_busy[j.w] = false; }
+      { std::lock_guard<std::mutex> lk(mu); out_bytes += j.bytes; if (j.w >= 0) out_busy[j.w] = false; }
       cv.notify_all();
     }
   });
@@ -532,12 +607,15 @@ int main(int argc, char **argv) {
                               const uint32_t *len, const uint32_t *hoff, const uint32_t *hlen,
                               StreamArgs sa) {
     uint64_t nu = nrec(i) / mates, u0 = rec0(i) / mates;
+    S.c_ubuf = ubuf; S.c_off = off; S.c_len = len; S.c_hoff = hoff; S.c_hlen = hlen;
+    CK(cudaMemsetAsync(S.nhost, 0, 4, S.st));
     S.tm[T_CLASSIFY].start(S.st);
     fused<<<8192, THREADS, 0, S.st>>>(
         ubuf, off, len, (uint32_t) nu, mates, k, l, ssm, tog, mahv,
         d_tab, skip_probe, sa, d_parent, d_extid, S.call,
-        hoff, hlen, S.text, TEXT_STRIDE, S.llen, d_over);
+        hoff, hlen, S.text, TEXT_STRIDE, S.llen, d_over, S.hunits, S.nhost);
     S.tm[T_CLASSIFY].stop(S.st);
+    CK(cudaMemcpyAsync(S.h_nhost, S.nhost, 4, cudaMemcpyDeviceToHost, S.st));
     if (out_path) {
       S.tm[T_OUTPUT].start(S.st);
       uint32_t nblk = (uint32_t) ((nu + 255) / 256);
@@ -553,12 +631,102 @@ int main(int argc, char **argv) {
     CK(cudaEventRecord(S.sized, S.st));
   };
 
+  // Classifies on the host the units of chunk i the device left to it (reads
+  // longer than MAX_LEN, lines too long for their slot, more distinct taxa
+  // than the device keeps), fills in their calls, and, with output, returns
+  // the chunk's lines with theirs merged in at their places.
+  HostCtx hc{h_tab, k, l, ssm, tog, mahv, skip_probe, h_par.data(), h_ext.data()};
+  // The pool is as large as the CPUs this process may run on, which under
+  // Slurm is the allocation rather than the node.
+  int host_cpus = (int) std::thread::hardware_concurrency();
+  { cpu_set_t cs; if (sched_getaffinity(0, sizeof cs, &cs) == 0) host_cpus = CPU_COUNT(&cs); }
+  int host_threads = env_int("K2GPU_HOST_THREADS", host_cpus);
+  if (host_threads < 1) host_threads = 1;
+  uint64_t host_units = 0, host_bases = 0;
+  double t_host = 0;
+  auto host_route = [&](size_t i, Set &S, uint32_t nh) -> std::shared_ptr<std::vector<char>> {
+    double th = now_s();
+    uint64_t nr = nrec(i), nu = nr / mates, u0 = rec0(i) / mates;
+    std::vector<uint32_t> units(nh), off(nr), len(nr), hoff(nr), hlen(nr), loff;
+    CK(cudaMemcpyAsync(units.data(), S.hunits, nh * 4, cudaMemcpyDeviceToHost, S.st));
+    CK(cudaMemcpyAsync(off.data(), S.c_off, nr * 4, cudaMemcpyDeviceToHost, S.st));
+    CK(cudaMemcpyAsync(len.data(), S.c_len, nr * 4, cudaMemcpyDeviceToHost, S.st));
+    CK(cudaMemcpyAsync(hoff.data(), S.c_hoff, nr * 4, cudaMemcpyDeviceToHost, S.st));
+    CK(cudaMemcpyAsync(hlen.data(), S.c_hlen, nr * 4, cudaMemcpyDeviceToHost, S.st));
+    CK(cudaStreamSynchronize(S.st));
+    std::sort(units.begin(), units.end());
+    struct Job { std::string seq[2], hdr, line; uint32_t call; };
+    std::vector<Job> jobs(nh);
+    for (uint32_t j = 0; j < nh; j++) {
+      uint32_t r = units[j];
+      for (int m = 0; m < mates; m++) {
+        uint32_t rec = r * mates + m;
+        jobs[j].seq[m].resize(len[rec]);
+        if (len[rec]) CK(cudaMemcpyAsync(&jobs[j].seq[m][0], S.c_ubuf + off[rec], len[rec],
+                                         cudaMemcpyDeviceToHost, S.st));
+        host_bases += len[rec];
+      }
+      uint32_t rec0 = r * mates;
+      jobs[j].hdr.resize(hlen[rec0]);
+      if (hlen[rec0]) CK(cudaMemcpyAsync(&jobs[j].hdr[0], S.c_ubuf + hoff[rec0], hlen[rec0],
+                                         cudaMemcpyDeviceToHost, S.st));
+    }
+    std::vector<char> packed;
+    if (out_path) {
+      loff.resize(nu);
+      CK(cudaMemcpyAsync(loff.data(), S.loff, nu * 4, cudaMemcpyDeviceToHost, S.st));
+      packed.resize((size_t) S.h_last[0] + S.h_last[1]);
+      if (!packed.empty())
+        CK(cudaMemcpyAsync(packed.data(), S.packed, packed.size(), cudaMemcpyDeviceToHost, S.st));
+    }
+    CK(cudaStreamSynchronize(S.st));
+    int nt = (int) std::min<uint32_t>(nh, (uint32_t) host_threads);
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nt; t++)
+      pool.emplace_back([&, t]() {
+        std::vector<uint32_t> tok;
+        for (uint32_t j = t; j < nh; j += nt)
+          jobs[j].call = classify_host(hc, mates, jobs[j].seq, jobs[j].hdr, tok,
+                                       out_path ? &jobs[j].line : nullptr);
+      });
+    for (auto &th : pool) th.join();
+    for (uint32_t j = 0; j < nh; j++) h_call[u0 + units[j]] = jobs[j].call;
+    host_units += nh;
+    std::shared_ptr<std::vector<char>> merged;
+    if (out_path) {
+      // A unit the host classified has an empty line on the device, so its
+      // line goes at the offset the device gave it.
+      merged = std::make_shared<std::vector<char>>();
+      size_t extra = 0;
+      for (auto &jb : jobs) extra += jb.line.size();
+      merged->reserve(packed.size() + extra);
+      size_t at = 0;
+      for (uint32_t j = 0; j < nh; j++) {
+        size_t pos = loff[units[j]];
+        merged->insert(merged->end(), packed.begin() + at, packed.begin() + pos);
+        merged->insert(merged->end(), jobs[j].line.begin(), jobs[j].line.end());
+        at = pos;
+      }
+      merged->insert(merged->end(), packed.begin() + at, packed.end());
+    }
+    t_host += now_s() - th;
+    return merged;
+  };
+
   // Hands chunk i's packed lines to the writer, in order.
   uint64_t done_units = 0;
   auto finalize = [&](size_t i, Set &S) {
     double tw = now_s();
     CK(cudaEventSynchronize(S.sized));
-    if (out_path) {
+    if (*S.h_nhost) {
+      t_wait_out += now_s() - tw;
+      std::shared_ptr<std::vector<char>> merged = host_route(i, S, *S.h_nhost);
+      if (out_path) {
+        size_t nb = merged->size();
+        { std::lock_guard<std::mutex> lk(mu); wq.push_back({-1, nb, std::move(merged)}); }
+        cv.notify_all();
+      }
+    } else if (out_path) {
       size_t tbytes = (size_t) S.h_last[0] + S.h_last[1];
       if (tbytes > out_cap) {
         fprintf(stderr, "packed output %zu bytes exceeds the %zu reserved\n", tbytes, out_cap);
@@ -570,7 +738,7 @@ int main(int argc, char **argv) {
       t_wait_out += now_s() - tw;
       CK(cudaMemcpyAsync(outbuf[w], S.packed, tbytes, cudaMemcpyDeviceToHost, S.st));
       CK(cudaEventRecord(outev[w], S.st));
-      { std::lock_guard<std::mutex> lk(mu); wq.push_back({w, tbytes}); }
+      { std::lock_guard<std::mutex> lk(mu); wq.push_back({w, tbytes, nullptr}); }
       cv.notify_all();
     } else t_wait_out += now_s() - tw;
     done_units += nrec(i) / mates;
@@ -672,7 +840,8 @@ int main(int argc, char **argv) {
           StreamArgs sa{BIN, nullptr, d_ref, (rec0(i) - R0) / mates * tok_stride, tok_stride, mate_stride,
                         0, 0, d_bh, d_bv, d_bc + (i - i0) * P, bcap[i - i0], bbase[i - i0]};
           fused<<<8192, THREADS, 0, cmp>>>(ub, o, ln, (uint32_t) (nrec(i) / mates), mates, k, l, ssm, tog, mahv,
-              d_tab, 0, sa, d_parent, d_extid, set[0].call, nullptr, nullptr, nullptr, 0, nullptr, nullptr);
+              d_tab, 0, sa, d_parent, d_extid, set[0].call, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
+              set[0].hunits, set[0].nhost);
         }
         CK(cudaEventRecord(b1ev, cmp));
         std::vector<uint32_t> cnt((i1 - i0) * P);
@@ -725,7 +894,8 @@ int main(int argc, char **argv) {
             StreamArgs sa{PROBE_GROUP, d_tok, nullptr, (rec0(i) - R0) / mates * tok_stride, tok_stride,
                           mate_stride, g * per, (g + 1) * per, nullptr, nullptr, nullptr, 0, 0};
             fused<<<8192, THREADS, 0, cmp>>>(ub, o, ln, (uint32_t) (nrec(i) / mates), mates, k, l, ssm, tog, mahv,
-                gt, 0, sa, d_parent, d_extid, set[0].call, nullptr, nullptr, nullptr, 0, nullptr, nullptr);
+                gt, 0, sa, d_parent, d_extid, set[0].call, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
+                set[0].hunits, set[0].nhost);
           }
         }
         CK(cudaEventRecord(p1[g], cmp));
@@ -772,6 +942,9 @@ int main(int argc, char **argv) {
     double ms = set[0].tm[t].ms + set[1].tm[t].ms;
     if (ms > 0) printf("  %-44s %8.3f\n", stage_name[t], ms / 1e3);
   }
+  printf("host classification: %" PRIu64 " of %" PRIu64 " units (%.4f%%), %.2f Mbase, "
+         "%.3f s on up to %d threads\n", host_units, done_units,
+         done_units ? 100.0 * host_units / done_units : 0.0, host_bases / 1e6, t_host, host_threads);
   printf("host threads (s):\n");
   printf("  %-44s %8.3f\n", "reader: reading input", t_read);
   printf("  %-44s %8.3f\n", "writer: writing output", t_write);
@@ -808,8 +981,9 @@ int main(int argc, char **argv) {
   FILE *rf = fopen(argv[6], "rb");
   if (!rf) { fprintf(stderr, "cannot open %s\n", argv[6]); return 1; }
   size_t bad = 0, seen = 0, classified = 0;
-  char line[16384];
-  for (uint64_t i = 0; i < done_units && fgets(line, sizeof line, rf); i++) {
+  // A long read's line can run to megabytes, so lines are read whole.
+  char *line = nullptr; size_t line_cap = 0;
+  for (uint64_t i = 0; i < done_units && getline(&line, &line_cap, rf) > 0; i++) {
     unsigned long want = 0;
     char *p1 = strchr(line, '\t');
     char *p2 = p1 ? strchr(p1 + 1, '\t') : nullptr;
@@ -821,7 +995,7 @@ int main(int argc, char **argv) {
       bad++;
     }
   }
-  fclose(rf);
+  fclose(rf); free(line);
   printf("verified %zu calls against classify (%.2f%% classified): %zu mismatched\n",
          seen, seen ? 100.0*classified/seen : 0.0, bad);
   return bad ? 2 : 0;

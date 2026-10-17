@@ -105,18 +105,35 @@ __global__ void fused(const char *__restrict__ bases,
                       const uint32_t *__restrict__ hdr_len,
                       char *__restrict__ out_text, uint32_t text_stride,
                       uint32_t *__restrict__ out_linelen,
-                      uint32_t *__restrict__ out_overflow) {
+                      uint32_t *__restrict__ out_overflow,
+                      uint32_t *__restrict__ host_units = nullptr,
+                      uint32_t *__restrict__ n_host = nullptr) {
   __shared__ uint64_t cand[MAX_LEN];
   __shared__ uint8_t  code[MAX_LEN];
   __shared__ uint64_t val[MAX_LEN];
   __shared__ int      look[MAX_LEN];
   __shared__ uint32_t ptax[MAX_LEN];
   __shared__ uint32_t stax[2 * MAX_LEN + 1];
-  __shared__ int amb_mate, n_tok, mate_len[2];
+  __shared__ int amb_mate, n_tok, mate_len[2], too_long;
   const bool tokens_wanted = sa.phase == CLASSIFY || sa.phase == FINISH;
 
   for (uint32_t r = blockIdx.x; r < n_units; r += gridDim.x) {
-    if (threadIdx.x == 0) n_tok = 0;
+    // With host_units given, a unit with a mate longer than MAX_LEN is left
+    // to the host: the launches that only look up skip it, and the ones that
+    // resolve add it to host_units with an empty line in place of its own.
+    if (threadIdx.x == 0) {
+      n_tok = 0; too_long = 0;
+      if (host_units)
+        for (int m = 0; m < mates; m++)
+          if (lengths[r * mates + m] > (uint32_t) MAX_LEN) too_long = 1;
+      if (too_long && tokens_wanted) {
+        host_units[atomicAdd(n_host, 1u)] = r;
+        out_call[r] = 0;
+        if (out_text) out_linelen[r] = 0;
+      }
+    }
+    __syncthreads();
+    if (too_long) { __syncthreads(); continue; }
     for (int m = 0; m < mates; m++) {
       uint32_t rec = r * mates + m;
       const char *seq = bases + offsets[rec];
@@ -224,9 +241,15 @@ __global__ void fused(const char *__restrict__ bases,
     // on a handful of values, so one thread does it rather than paying for a
     // reduction across the block.
     if (threadIdx.x == 0) {
-      uint32_t call = k2c::call_of(parent, stax, n_tok);
+      bool many = false;
+      uint32_t call = k2c::call_of(parent, stax, n_tok, host_units ? &many : nullptr);
       out_call[r] = (uint32_t) (call ? extid[call] : 0);
-      if (out_text) {
+      if (many) {
+        // More distinct taxa than call_of keeps: the host resolves it.
+        host_units[atomicAdd(n_host, 1u)] = r;
+        out_call[r] = 0;
+        if (out_text) out_linelen[r] = 0;
+      } else if (out_text) {
         // A hit list has one run per change of taxon, so a long read can
         // produce a long line.  Rather than size the slot for the worst case,
         // the formatter stops short of the end and reports it, so a
@@ -239,7 +262,11 @@ __global__ void fused(const char *__restrict__ bases,
                                  bases + hdr_off[rec0], hdr_len[rec0], mates == 2,
                                  (uint32_t) mate_len[0], mates == 2 ? (uint32_t) mate_len[1] : 0u,
                                  stax, n_tok, &over);
-        if (over) atomicAdd(out_overflow, 1u);
+        if (over && host_units) {
+          // The line did not fit its slot; the host writes it instead.
+          host_units[atomicAdd(n_host, 1u)] = r;
+          n = 0;
+        } else if (over) atomicAdd(out_overflow, 1u);
         out_linelen[r] = (uint32_t) n;
       }
     }

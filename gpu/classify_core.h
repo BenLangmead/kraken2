@@ -131,14 +131,19 @@ K2HD uint32_t resolve(const uint64_t *parent, const uint32_t *tax, const uint32_
 }
 
 // Distinct taxa and their counts over a token array, skipping zeros and
-// markers, then the call.  At most 64 distinct taxa are kept, as before.
-K2HD uint32_t call_of(const uint64_t *parent, const uint32_t *tok, int n) {
+// markers, then the call.  At most 64 distinct taxa are kept; when a token
+// array has more, the call may differ from classify's, so *over (if given)
+// is set and the caller classifies the unit some other way.
+K2HD uint32_t call_of(const uint64_t *parent, const uint32_t *tok, int n, bool *over = nullptr) {
   uint32_t tx[64], ct[64]; int nd = 0;
   for (int j = 0; j < n; j++) {
     uint32_t t = tok[j];
     if (!t || t >= AMBIG) continue;
     int q = 0; while (q < nd && tx[q] != t) q++;
-    if (q == nd) { if (nd < 64) { tx[nd] = t; ct[nd] = 1; nd++; } }
+    if (q == nd) {
+      if (nd < 64) { tx[nd] = t; ct[nd] = 1; nd++; }
+      else if (over) *over = true;
+    }
     else ct[q]++;
   }
   return resolve(parent, tx, ct, nd);
