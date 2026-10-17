@@ -293,7 +293,8 @@ class BlockedTableBuilder {
                       const Taxonomy &tax, int remainder_bits = 0,
                       uint64_t kept_partitions = 0);
 
-  // Per-thread buffer; Add() is not thread-safe, Flush() is.
+  // Per-thread buffer; Add() is not thread-safe, Flush() is.  Flush() adds
+  // the buffered records without reducing partitions, which Write() does.
   class Buffer {
     public:
     explicit Buffer(BlockedTableBuilder &b);
@@ -314,8 +315,11 @@ class BlockedTableBuilder {
   uint64_t pext_mask() const { return pext_mask_; }
 
   private:
-  void Append(size_t part, std::vector<Rec> &recs);
+  void Append(size_t part, std::vector<Rec> &recs, bool may_reduce = true);
   void Reduce(std::vector<Rec> &v);
+  void ReduceTail(std::vector<Rec> &v, size_t from);
+  void FinishPartition(size_t part);
+  void Gather(std::vector<Rec> &dst, std::vector<std::vector<Rec> > &chunks);
 
   uint64_t pext_mask_;
   int p_, B_;
@@ -326,8 +330,13 @@ class BlockedTableBuilder {
   const Taxonomy &tax_;
   blocked::Pext pext_;
   blocked::Mix mix_;
+  // Each partition's records are one run (parts_).  While a thread grows or
+  // reduces a run outside the lock, buffers for that partition wait on
+  // pending_.
   std::vector<std::vector<Rec> > parts_;
+  std::vector<std::vector<std::vector<Rec> > > pending_;
   std::vector<size_t> reduced_size_;
+  std::vector<char> busy_;
   std::vector<std::mutex> locks_;
 };
 

@@ -12,6 +12,10 @@
 #include "blocked_table.h"
 #include "kraken2_data.h"
 #include "utilities.h"
+#include <mutex>
+#include <deque>
+#include <condition_variable>
+#include <atomic>
 
 using std::string;
 using std::map;
@@ -386,10 +390,12 @@ void usage(int exit_code) {
 }
 
 // Collects every (minimizer, taxon) pair of the library into a blocked
-// table.  Sequences are read one block at a time and scanned in parallel in
-// overlapping subblocks, as in ProcessSequences.  The table is a function of
-// the set of pairs alone, so the result does not depend on sequence order or
-// thread count.
+// table.  Thread 0 reads sequences one block at a time, splits them into
+// overlapping subblocks, and queues the subblocks in units; the other threads
+// scan units as they arrive.  There is no barrier between blocks, so a thread
+// that stops to reduce a partition holds up only its own unit while reading
+// and scanning go on.  The table is a function of the set of pairs alone, so
+// the result does not depend on sequence order, scheduling or thread count.
 void BuildBlockedTable(const Taxonomy &taxonomy,
     const map<string, taxid_t> &ID_to_taxon_map, const Options &opts,
     size_t bits_for_taxid)
@@ -406,84 +412,154 @@ void BuildBlockedTable(const Taxonomy &taxonomy,
   for (int t = 0; t < threads; t++)
     buffers[t] = new BlockedTableBuilder::Buffer(builder);
 
+  // A block owns its reader, and so the buffer its items point into, until the
+  // last of its units is scanned.
   struct Item { const char *seq; size_t len; taxid_t taxid; size_t start, finish; };
-  vector<Item> items;
+  struct Block {
+    FastReader reader;
+    vector<Item> items;
+    std::atomic<size_t> units_left;
+  };
+  struct Unit { Block *block; size_t begin, end; };
+  const size_t UNIT_ITEMS = 64;
+  std::deque<Unit> queue;
+  std::mutex queue_lock;
+  std::condition_variable work_ready, space_ready;
+  bool input_done = false;
+
+  auto scan_unit = [&](const Unit &u, MinimizerScanner &scanner,
+                       BlockedTableBuilder::Buffer &buf) {
+    Block &b = *u.block;
+    for (size_t n = u.begin; n < u.end; n++) {
+      const Item &it = b.items[n];
+      scanner.LoadSequence(it.seq, it.len, it.start, it.finish);
+      uint64_t *minimizer_ptr;
+      uint64_t last = UINT64_MAX;
+      while ((minimizer_ptr = scanner.NextMinimizer())) {
+        if (scanner.is_ambiguous())
+          continue;
+        uint64_t m = *minimizer_ptr;
+        if (m == last)
+          continue;
+        last = m;
+        if (opts.min_clear_hash_value &&
+            MurmurHash3(m) < opts.min_clear_hash_value)
+          continue;
+        buf.Add(m, (uint32_t) it.taxid);
+      }
+    }
+    if (--b.units_left == 0)
+      delete u.block;
+  };
+
   size_t processed_seq_ct = 0;
   size_t processed_ch_ct = 0;
   int fd = fileno(stdin);
   StreamCursor cursor;
   bool have_input = PrimeStream(fd, cursor);
-  FastReader reader;
-  // Items point into the reader's buffer, so each block is scanned before the
-  // next one is loaded over it.
-  while (have_input && reader.LoadBlock(fd, cursor, opts.block_size)) {
-    reader.Parse();
-    items.clear();
-    for (size_t j = 0; j < reader.size(); j++) {
-      const SeqView &sequence = reader[j];
-      auto all_sequence_ids = ExtractNCBISequenceIDs(sequence.header,
-                                                     sequence.header_len);
-      taxid_t taxid = 0;
-      for (auto &seqid : all_sequence_ids) {
-        if (ID_to_taxon_map.count(seqid) == 0 ||
-            ID_to_taxon_map.at(seqid) == 0)
-          continue;
-        taxid = taxonomy.LowestCommonAncestor(
-            taxid, taxonomy.GetInternalID(ID_to_taxon_map.at(seqid)));
-      }
-      if (! taxid)
-        continue;
-      size_t len = sequence.seq_len;
-      // Consecutive subblocks overlap by k - 1 characters, so every k-mer
-      // lies wholly inside at least one of them.
-      for (size_t i = 0; i < len; i += opts.subblock_size) {
-        size_t finish = std::min(len, i + opts.subblock_size + opts.k - 1);
-        Item item = { sequence.seq, len, taxid, i, finish };
-        items.push_back(item);
-        if (finish == len)
+  string fault;
+  #pragma omp parallel num_threads(threads)
+  {
+    const int tid = omp_get_thread_num();
+    const int team = omp_get_num_threads();
+    BlockedTableBuilder::Buffer &buf = *buffers[tid];
+    MinimizerScanner scanner(opts.k, opts.l, opts.spaced_seed_mask,
+                             true, opts.toggle_mask);
+    if (tid == 0) {
+      // Keeps about four units per scanning thread queued, which bounds
+      // the sequence held in memory to a few blocks.
+      const size_t max_queued = 4 * (size_t) std::max(team - 1, 1);
+      while (have_input) {
+        Block *block = new Block();
+        if (! block->reader.LoadBlock(fd, cursor, opts.block_size)) {
+          delete block;
           break;
-      }
-      processed_seq_ct++;
-      processed_ch_ct += len;
-    }
-    #pragma omp parallel num_threads(threads)
-    {
-      BlockedTableBuilder::Buffer &buf = *buffers[omp_get_thread_num()];
-      MinimizerScanner scanner(opts.k, opts.l, opts.spaced_seed_mask,
-                               true, opts.toggle_mask);
-      #pragma omp for schedule(dynamic, 64)
-      for (size_t n = 0; n < items.size(); n++) {
-        const Item &it = items[n];
-        scanner.LoadSequence(it.seq, it.len, it.start, it.finish);
-        uint64_t *minimizer_ptr;
-        uint64_t last = UINT64_MAX;
-        while ((minimizer_ptr = scanner.NextMinimizer())) {
-          if (scanner.is_ambiguous())
+        }
+        block->reader.Parse();
+        if (fault.empty())
+          fault = block->reader.fault();
+        for (size_t j = 0; j < block->reader.size(); j++) {
+          const SeqView &sequence = block->reader[j];
+          auto all_sequence_ids = ExtractNCBISequenceIDs(sequence.header,
+                                                         sequence.header_len);
+          taxid_t taxid = 0;
+          for (auto &seqid : all_sequence_ids) {
+            if (ID_to_taxon_map.count(seqid) == 0 ||
+                ID_to_taxon_map.at(seqid) == 0)
+              continue;
+            taxid = taxonomy.LowestCommonAncestor(
+                taxid, taxonomy.GetInternalID(ID_to_taxon_map.at(seqid)));
+          }
+          if (! taxid)
             continue;
-          uint64_t m = *minimizer_ptr;
-          if (m == last)
-            continue;
-          last = m;
-          if (opts.min_clear_hash_value &&
-              MurmurHash3(m) < opts.min_clear_hash_value)
-            continue;
-          buf.Add(m, (uint32_t) it.taxid);
+          size_t len = sequence.seq_len;
+          // Consecutive subblocks overlap by k - 1 characters, so every
+          // k-mer lies wholly inside at least one of them.
+          for (size_t i = 0; i < len; i += opts.subblock_size) {
+            size_t finish = std::min(len, i + opts.subblock_size + opts.k - 1);
+            Item item = { sequence.seq, len, taxid, i, finish };
+            block->items.push_back(item);
+            if (finish == len)
+              break;
+          }
+          processed_seq_ct++;
+          processed_ch_ct += len;
+        }
+        const size_t n_items = block->items.size();
+        const size_t n_units = (n_items + UNIT_ITEMS - 1) / UNIT_ITEMS;
+        if (n_units == 0) {
+          delete block;
+          continue;
+        }
+        block->units_left = n_units;
+        if (team == 1) {
+          for (size_t i = 0; i < n_items; i += UNIT_ITEMS)
+            scan_unit(Unit{block, i, std::min(n_items, i + UNIT_ITEMS)}, scanner, buf);
+        }
+        else {
+          std::unique_lock<std::mutex> g(queue_lock);
+          for (size_t i = 0; i < n_items; i += UNIT_ITEMS) {
+            space_ready.wait(g, [&] { return queue.size() < max_queued; });
+            queue.push_back(Unit{block, i, std::min(n_items, i + UNIT_ITEMS)});
+            work_ready.notify_one();
+          }
+        }
+        if (isatty(fileno(stderr))) {
+          std::cerr << "\rProcessed " << processed_seq_ct << " sequences ("
+                    << processed_ch_ct << " bp)...";
         }
       }
+      std::lock_guard<std::mutex> g(queue_lock);
+      input_done = true;
+      work_ready.notify_all();
     }
-    if (isatty(fileno(stderr))) {
-      std::cerr << "\rProcessed " << processed_seq_ct << " sequences ("
-                << processed_ch_ct << " bp)...";
+    else {
+      while (true) {
+        Unit u;
+        {
+          std::unique_lock<std::mutex> g(queue_lock);
+          work_ready.wait(g, [&] { return ! queue.empty() || input_done; });
+          if (queue.empty())
+            break;
+          u = queue.front();
+          queue.pop_front();
+          space_ready.notify_one();
+        }
+        scan_unit(u, scanner, buf);
+      }
     }
   }
   if (! cursor.error.empty())
     errx(EX_IOERR, "%s (standard input)", cursor.error.c_str());
-  if (! reader.fault().empty())
-    warnx("%s", reader.fault().c_str());
+  if (! fault.empty())
+    warnx("%s", fault.c_str());
   if (isatty(fileno(stderr)))
     std::cerr << "\r";
   std::cerr << "Completed processing of " << processed_seq_ct << " sequences, "
             << processed_ch_ct << " bp" << std::endl;
+  // Each buffer's last records go to their partitions, in parallel since an
+  // append can reduce a partition.
+  #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
   for (int t = 0; t < threads; t++)
     delete buffers[t];
 
