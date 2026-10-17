@@ -547,6 +547,9 @@ void BuildBlockedTable(const Taxonomy &taxonomy,
     std::cerr << "\r";
   std::cerr << "Completed processing of " << processed_seq_ct << " sequences, "
             << processed_ch_ct << " bp" << std::endl;
+  // Each buffer's last records go to their partitions, in parallel since an
+  // append can reduce a partition.
+  #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
   for (int t = 0; t < threads; t++)
     delete buffers[t];
 

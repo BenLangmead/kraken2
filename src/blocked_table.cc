@@ -481,9 +481,26 @@ struct StageClock {
     last = t;
   }
 };
-const int PLACE_STEPS = 7;
+const int PLACE_STEPS = 8;
 const char *const PLACE_STEP_NAMES[PLACE_STEPS] = {
-  "entries", "natives", "overflow sort", "alt", "augment", "stash", "pack"};
+  "entries", "natives", "overflow sort", "alt", "augment", "stash", "pack",
+  "check, write"};
+}
+
+static bool pwrite_fully(int fd, const void *buf, size_t n, off_t off) {
+  const char *p = (const char *) buf;
+  while (n > 0) {
+    ssize_t w = pwrite(fd, p, n, off);
+    if (w < 0) {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+    p += w;
+    n -= (size_t) w;
+    off += w;
+  }
+  return true;
 }
 
 static inline void set_bits(uint64_t *b, int off, int len, uint64_t val) {
@@ -497,11 +514,16 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
   const int AUGMENT_LIMIT = 2000;  // buckets visited per augmenting search
   StageClock clock;
 
+  // Every stored taxon must fit in taxonomy_bits; the merge below changes no
+  // taxon, so the reduced partitions are checked here.
   #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
   for (uint64_t part = 0; part < (uint64_t) parts_.size(); part++) {
     Gather(parts_[part], pending_[part]);
     Reduce(parts_[part]);
     parts_[part].shrink_to_fit();
+    for (auto &rec : parts_[part])
+      if (rec.taxid >> taxonomy_bits || rec.taxid >= tax_.node_count())
+        errx(EX_SOFTWARE, "taxon %u does not fit in %d bits", rec.taxid, taxonomy_bits);
   }
   clock.mark("final reduce");
   uint64_t N = 0;
@@ -519,7 +541,10 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
       p++;
     int d = p_ - p;
     if (d > 0) {
+      // A merged partition holds fewer than 2 * BLOCKED_AUTO_MIN_KEYS keys,
+      // so merging in parallel adds little memory.
       vector<vector<Rec> > merged(1ULL << p);
+      #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
       for (uint64_t j = 0; j < merged.size(); j++) {
         size_t n = 0;
         for (uint64_t i = j << d; i < (j + 1) << d; i++)
@@ -538,11 +563,6 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
   const uint64_t P = parts_.size();
   const uint64_t K = kept_ ? kept_ : P;
   const int q = B_ - p_;
-  for (uint64_t part = 0; part < P; part++)
-    for (auto &rec : parts_[part])
-      if (rec.taxid >> taxonomy_bits || rec.taxid >= tax_.node_count())
-        errx(EX_SOFTWARE, "taxon %u does not fit in %d bits", rec.taxid, taxonomy_bits);
-  clock.mark("taxon check");
 
   // Entries of one partition as (home << r | rem, internal taxon), sorted
   // and distinct.  In exact mode recs are sorted by hash, and home and rem
@@ -592,33 +612,29 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
 
   // Entry count of every internal taxon over the kept partitions, so codes
   // number only the taxa the table stores.  In exact mode entries are keys.
+  // Each thread counts into its own histogram over the taxonomy's nodes.
   auto count_taxa = [&](int r, uint64_t nb, bool exact) {
-    vector<uint64_t> count(tax_.node_count(), 0);
-    std::mutex count_lock;
-    #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (uint64_t part = 0; part < K; part++) {
-      vector<uint32_t> t;
-      if (exact) {
-        t.resize(parts_[part].size());
-        for (size_t i = 0; i < t.size(); i++)
-          t[i] = parts_[part][i].taxid;
+    const size_t nodes = tax_.node_count();
+    vector<uint64_t> count(nodes, 0);
+    #pragma omp parallel num_threads(threads)
+    {
+      vector<uint64_t> c(nodes, 0);
+      vector<pair<uint64_t, uint32_t> > e;
+      #pragma omp for schedule(dynamic, 1) nowait
+      for (uint64_t part = 0; part < K; part++) {
+        if (exact) {
+          for (auto &rec : parts_[part])
+            c[rec.taxid]++;
+        }
+        else {
+          make_entries(part, r, nb, false, e, nullptr);
+          for (auto &x : e)
+            c[x.second]++;
+        }
       }
-      else {
-        vector<pair<uint64_t, uint32_t> > e;
-        make_entries(part, r, nb, false, e, nullptr);
-        t.resize(e.size());
-        for (size_t i = 0; i < t.size(); i++)
-          t[i] = e[i].second;
-      }
-      std::sort(t.begin(), t.end());
-      std::lock_guard<std::mutex> g(count_lock);
-      for (size_t i = 0; i < t.size(); ) {
-        size_t j = i;
-        while (j < t.size() && t[j] == t[i])
-          j++;
-        count[t[i]] += j - i;
-        i = j;
-      }
+      #pragma omp critical(blocked_count_taxa)
+      for (size_t t = 0; t < nodes; t++)
+        count[t] += c[t];
     }
     return count;
   };
@@ -699,24 +715,62 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
   const int w = G.w, H = G.H, sf = G.sf;
   const uint64_t rmask = G.rmask;
 
-  size_t bucket_bytes = K * nb * 64;
-  uint64_t *table;
-  if (posix_memalign((void **) &table, (size_t) 1 << 21, bucket_bytes) != 0)
-    errx(EX_OSERR, "unable to allocate %zu bytes for the blocked table", bucket_bytes);
-  memset(table, 0, bucket_bytes);
-  clock.mark("codes, allocate");
+  if (nb >= (1ULL << 31))
+    errx(EX_SOFTWARE, "blocked table partition would have %llu buckets",
+         (unsigned long long) nb);
+  const size_t part_bytes = nb * 64;
+  const size_t bucket_bytes = K * part_bytes;
+
+  // The header's geometry; its counts are filled in after placement.
+  BlockedTableHeader hdr;
+  memset(&hdr, 0, sizeof(hdr));
+  hdr.magic = BLOCKED_TABLE_MAGIC;
+  hdr.version = 2;
+  hdr.bucket_bytes = 64;
+  hdr.partition_bits = p_;
+  hdr.key_bits = B_;
+  hdr.remainder_bits = r;
+  hdr.value_bits = value_bits;
+  hdr.slots = S;
+  hdr.spill_bits = sf;
+  hdr.buckets_per_partition = nb;
+  hdr.kept_partitions = kept_ ? K : 0;
+  hdr.pext_mask = pext_mask_;
+  hdr.taxon_codes = U;
+
+  // The file is the header, the buckets of every kept partition in order,
+  // the stash offsets, the stash keys and values, and the taxon of each code.
+  // Each partition's buckets are written at their offset as soon as they are
+  // placed and checked, so the whole bucket array is never in memory.
+  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (fd < 0)
+    err(EX_CANTCREAT, "unable to create %s", filename);
+  auto fail = [&](const char *what) {
+    close(fd);
+    unlink(filename);
+    errx(EX_IOERR, "%s %s", what, filename);
+  };
+  uint64_t kept_keys = 0;
+  for (uint64_t part = 0; part < K; part++)
+    kept_keys += parts_[part].size();
+  clock.mark("codes, open");
 
   vector<vector<uint64_t> > stash_keys(K);
   vector<vector<uint32_t> > stash_vals(K);
   vector<uint64_t> guests(K, 0), spilled(K, 0), stored(K, 0);
-  // Fingerprint mode: the taxon each record's lookup must return, which is
-  // the LCA of every record sharing its (home, rem).
-  vector<vector<uint32_t> > expect(exact ? 0 : K);
   vector<double> step_time(clock.on ? K * PLACE_STEPS : 0, 0);
   vector<double> thread_done(clock.on ? threads : 0, 0);
   vector<uint64_t> over_ct(K, 0), left_ct(K, 0);
+  uint64_t bad = 0, merged_changed = 0;
+  int write_failed = 0;
 
-  #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+  #pragma omp parallel num_threads(threads) reduction(+:bad, merged_changed)
+  {
+  // A thread's buckets for the partition it is placing, allocated when it
+  // gets its first partition.
+  vector<uint64_t> buckets;
+  vector<uint64_t> stash_off(K + 1, 0);
+  #pragma omp for schedule(dynamic, 1)
   for (uint64_t part = 0; part < K; part++) {
     double t_step = clock.on ? clock.now() : 0;
     auto step = [&](int k) {
@@ -727,20 +781,29 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
       t_step = t;
       thread_done[omp_get_thread_num()] = t;
     };
-    // Entries as (home << r | rem, taxon code), sorted.
+    // Entries as (home << r | rem, taxon code), sorted.  In fingerprint mode
+    // expect gets the taxon each record's lookup must return, which is the
+    // LCA of every record sharing its (home, rem).
     vector<pair<uint64_t, uint32_t> > e;
-    make_entries(part, r, nb, exact, e, exact ? nullptr : &expect[part]);
+    vector<uint32_t> expect;
+    make_entries(part, r, nb, exact, e, exact ? nullptr : &expect);
     for (auto &x : e)
       x.second = taxon_code[x.second];
     stored[part] = e.size();
+    if (buckets.empty())
+      buckets.resize(nb * 8);
+    else
+      std::fill(buckets.begin(), buckets.end(), 0);
     step(0);
-    uint64_t base = part * nb;
     // Placement on a flat slot array: cnt[b] entries of bucket b live in
-    // slot[b*S .. b*S+cnt[b]), as indices into e; at_alt[i] says whether
-    // entry i sits in its alt bucket.
+    // slot[b*S .. b*S+cnt[b]), as indices into e, each with the other bucket
+    // it could move to; at_alt[i] says whether entry i sits in its alt
+    // bucket.  Keeping the other bucket in the slot lets the augmenting
+    // search read a bucket's moves from its two slot cache lines alone.
+    struct Slot { uint32_t i, other; };
     vector<uint8_t> cnt(nb, 0);
     vector<uint64_t> spill(nb, 0);
-    vector<uint32_t> slot(nb * S);
+    vector<Slot> slot(nb * S);
     vector<uint8_t> at_alt(e.size(), 0);
     auto home_of = [&](uint32_t i) { return e[i].first >> r; };
     auto alt_of = [&](uint32_t i) {
@@ -760,7 +823,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
         j++;
       for (size_t a = i; a < j; a++) {
         if (a < i + S)
-          slot[home * S + cnt[home]++] = a;
+          slot[home * S + cnt[home]++] = Slot{(uint32_t) a, (uint32_t) alt_of(a)};
         else
           over.push_back(a);
       }
@@ -768,19 +831,22 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     }
     step(1);
     // Overflow goes to alt buckets in (alt, rem, index) order while they
-    // have room.
-    std::sort(over.begin(), over.end(), [&](uint32_t a, uint32_t b) {
-      uint64_t aa = alt_of(a), ab = alt_of(b);
-      if (aa != ab) return aa < ab;
-      uint64_t ra = e[a].first & rmask, rb = e[b].first & rmask;
-      return ra != rb ? ra < rb : a < b;
+    // have room.  Each entry's alt bucket is computed once, for the sort.
+    struct Over { uint64_t alt, rem; uint32_t i; };
+    vector<Over> over_by_alt(over.size());
+    for (size_t k = 0; k < over.size(); k++)
+      over_by_alt[k] = Over{alt_of(over[k]), e[over[k]].first & rmask, over[k]};
+    std::sort(over_by_alt.begin(), over_by_alt.end(), [](const Over &a, const Over &b) {
+      if (a.alt != b.alt) return a.alt < b.alt;
+      return a.rem != b.rem ? a.rem < b.rem : a.i < b.i;
     });
     step(2);
     vector<uint32_t> left;
-    for (auto i : over) {
-      uint64_t a = alt_of(i);
+    for (auto &o : over_by_alt) {
+      uint32_t i = o.i;
+      uint64_t a = o.alt;
       if (cnt[a] < S) {
-        slot[a * S + cnt[a]++] = i;
+        slot[a * S + cnt[a]++] = Slot{i, (uint32_t) home_of(i)};
         at_alt[i] = 1;
       }
       else {
@@ -797,16 +863,17 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     vector<uint32_t> stash_idx;
     if (! left.empty()) {
       std::sort(left.begin(), left.end());
-      vector<int64_t> from_bucket(nb, -2);
+      // Bucket indices fit in 31 bits, since entry indices fit in 32.
+      vector<int32_t> from_bucket(nb, -2);
       vector<uint32_t> via_entry(nb);
-      vector<uint64_t> touched, queue;
+      vector<uint32_t> touched, queue;
       for (auto k : left) {
         queue.clear();
         touched.clear();
-        uint64_t h0 = home_of(k), a0 = alt_of(k);
-        uint64_t starts[2] = {h0, a0};
+        uint32_t h0 = home_of(k), a0 = alt_of(k);
+        uint32_t starts[2] = {h0, a0};
         for (int si = 0; si < 2; si++) {
-          uint64_t s0 = starts[si];
+          uint32_t s0 = starts[si];
           if (from_bucket[s0] != -2) continue;
           from_bucket[s0] = -1;
           touched.push_back(s0);
@@ -814,33 +881,40 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
         }
         int64_t found = -1;
         for (size_t qi = 0; qi < queue.size() && found < 0; qi++) {
-          uint64_t X = queue[qi];
-          if (cnt[X] < S) { found = X; break; }
+          uint32_t X = queue[qi];
+          const int c = cnt[X];
+          if (c < S) { found = X; break; }
           if (touched.size() >= (size_t) AUGMENT_LIMIT) continue;
-          for (int s = 0; s < cnt[X]; s++) {
-            uint32_t j = slot[X * S + s];
-            uint64_t Y = at_alt[j] ? home_of(j) : alt_of(j);
+          const Slot *sx = &slot[(size_t) X * S];
+          for (int s = 0; s < c; s++)
+            __builtin_prefetch(&from_bucket[sx[s].other]);
+          for (int s = 0; s < c; s++) {
+            uint32_t Y = sx[s].other;
             if (from_bucket[Y] != -2) continue;
             from_bucket[Y] = X;
-            via_entry[Y] = j;
+            via_entry[Y] = sx[s].i;
             touched.push_back(Y);
             queue.push_back(Y);
+            __builtin_prefetch(&cnt[Y]);
+            __builtin_prefetch(&slot[(size_t) Y * S]);
+            __builtin_prefetch(&slot[(size_t) Y * S + S - 1]);
           }
         }
         if (found >= 0) {
-          // Walk back: move via_entry[Y] from from_bucket[Y] into Y.
-          uint64_t Y = found;
+          // Walk back: move via_entry[Y] from from_bucket[Y] into Y, where
+          // its other bucket becomes X.
+          uint32_t Y = found;
           while (from_bucket[Y] >= 0) {
-            uint64_t X = from_bucket[Y];
+            uint32_t X = from_bucket[Y];
             uint32_t j = via_entry[Y];
             int s = 0;
-            while (slot[X * S + s] != j) s++;
-            slot[X * S + s] = slot[X * S + --cnt[X]];
-            slot[Y * S + cnt[Y]++] = j;
+            while (slot[(size_t) X * S + s].i != j) s++;
+            slot[(size_t) X * S + s] = slot[(size_t) X * S + --cnt[X]];
+            slot[(size_t) Y * S + cnt[Y]++] = Slot{j, X};
             at_alt[j] ^= 1;
             Y = X;
           }
-          slot[Y * S + cnt[Y]++] = k;
+          slot[(size_t) Y * S + cnt[Y]++] = Slot{k, Y == h0 ? a0 : h0};
           at_alt[k] = (Y != h0);
         }
         else {
@@ -867,7 +941,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
       nat_l.clear();
       gst_l.clear();
       for (int s = 0; s < cnt[b]; s++) {
-        uint32_t i = slot[b * S + s];
+        uint32_t i = slot[b * S + s].i;
         if (at_alt[i]) {
           gst_l.push_back(i);
           spill[home_of(i)] |= 1ULL << sbit(i);
@@ -881,7 +955,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
         uint64_t ra = e[a].first & rmask, rc = e[c].first & rmask;
         return ra != rc ? ra < rc : a < c;
       });
-      uint64_t *bw = table + (base + b) * 8;
+      uint64_t *bw = buckets.data() + b * 8;
       int f = 0;
       for (auto i : nat_l)
         set_bits(bw, H + f++ * w, w, (e[i].first & rmask) | ((uint64_t) e[i].second << r));
@@ -891,7 +965,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
       nat_ct[b] = nat_l.size();
     }
     for (uint64_t b = 0; b < nb; b++) {
-      uint64_t *bw = table + (base + b) * 8;
+      uint64_t *bw = buckets.data() + b * 8;
       set_bits(bw, 0, BLOCKED_COUNT_BITS, nat_ct[b] | ((uint64_t) cnt[b] << 7));
       set_bits(bw, BLOCKED_COUNT_BITS, sf, spill[b]);
       sp += spill[b] != 0;
@@ -899,6 +973,38 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     guests[part] = g_ct;
     spilled[part] = sp;
     step(6);
+
+    // Self-check: every key must come back with its own taxon (in
+    // fingerprint mode, the LCA of its entry) through the same lookup code
+    // classify uses.  A lookup reads only its own partition's buckets and
+    // stash, so a table that holds just this partition answers it as the
+    // whole table would; buckets_ is offset so that this partition's
+    // buckets are where the whole table would have them.
+    {
+      BlockedTable T;
+      T.header_ = hdr;
+      T.buckets_ = (const uint8_t *) ((uintptr_t) buckets.data() - part * part_bytes);
+      stash_off[part] = 0;
+      stash_off[part + 1] = stash_keys[part].size();
+      T.stash_offsets_ = stash_off.data();
+      T.stash_keys_ = stash_keys[part].data();
+      T.stash_vals_ = stash_vals[part].data();
+      T.code_taxa_ = code_taxa.data();
+      T.Init();
+      const vector<Rec> &recs = parts_[part];
+      for (size_t i = 0; i < recs.size(); i++)
+        bad += T.GetByHash(recs[i].h) != (exact ? recs[i].taxid : expect[i]);
+      // Records whose own taxon differs from the LCA they now share.
+      if (! exact)
+        for (size_t i = 0; i < recs.size(); i++)
+          merged_changed += recs[i].taxid != expect[i];
+    }
+    if (! pwrite_fully(fd, buckets.data(), part_bytes,
+                       (off_t) (BLOCKED_TABLE_HEADER_BYTES + part * part_bytes)))
+      write_failed = 1;
+    vector<Rec>().swap(parts_[part]);
+    step(7);
+  }
   }
   clock.mark("placement");
   if (clock.on) {
@@ -932,6 +1038,29 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     fprintf(stderr, "\n");
   }
 
+  // Every key of a dropped partition must miss.
+  if (K < P) {
+    BlockedTable T;
+    T.header_ = hdr;
+    T.code_taxa_ = code_taxa.data();
+    T.Init();
+    #pragma omp parallel for schedule(dynamic, 1) reduction(+:bad) num_threads(threads)
+    for (uint64_t part = K; part < P; part++) {
+      for (auto &rec : parts_[part])
+        bad += T.GetByHash(rec.h) != 0;
+      vector<Rec>().swap(parts_[part]);
+    }
+  }
+  if (bad) {
+    close(fd);
+    unlink(filename);
+    errx(EX_SOFTWARE, "blocked table self-check failed for %llu keys",
+         (unsigned long long) bad);
+  }
+  if (write_failed)
+    fail("error writing");
+  clock.mark("check dropped");
+
   // Flatten the stash.
   vector<uint64_t> offsets(K + 1, 0), skeys;
   vector<uint32_t> svals;
@@ -940,92 +1069,37 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     skeys.insert(skeys.end(), stash_keys[part].begin(), stash_keys[part].end());
     svals.insert(svals.end(), stash_vals[part].begin(), stash_vals[part].end());
   }
-
-  BlockedTableHeader hdr;
-  memset(&hdr, 0, sizeof(hdr));
-  hdr.magic = BLOCKED_TABLE_MAGIC;
-  hdr.version = 2;
-  hdr.bucket_bytes = 64;
-  hdr.partition_bits = p_;
-  hdr.key_bits = B_;
-  hdr.remainder_bits = r;
-  hdr.value_bits = value_bits;
-  hdr.slots = S;
-  hdr.spill_bits = sf;
-  hdr.buckets_per_partition = nb;
-  hdr.kept_partitions = kept_ ? K : 0;
   uint64_t entries = 0;
-  for (uint64_t part = 0; part < K; part++)
-    entries += stored[part];
-  hdr.entries = entries;
-  hdr.stash_entries = skeys.size();
-  hdr.pext_mask = pext_mask_;
   for (uint64_t part = 0; part < K; part++) {
+    entries += stored[part];
     hdr.guests += guests[part];
     hdr.spilled_buckets += spilled[part];
   }
-  hdr.taxon_codes = U;
+  hdr.entries = entries;
+  hdr.stash_entries = skeys.size();
 
-  clock.mark("flatten stash");
-  // Self-check: every key must come back with its own taxon (in fingerprint
-  // mode, the LCA of its entry) through the same lookup code classify uses,
-  // and every key of a dropped partition must miss.
-  {
-    BlockedTable T;
-    T.header_ = hdr;
-    T.buckets_ = (const uint8_t *) table;
-    T.stash_offsets_ = offsets.data();
-    T.stash_keys_ = skeys.data();
-    T.stash_vals_ = svals.data();
-    T.code_taxa_ = code_taxa.data();
-    T.Init();
-    uint64_t bad = 0;
-    #pragma omp parallel for schedule(dynamic, 1) reduction(+:bad) num_threads(threads)
-    for (uint64_t part = 0; part < P; part++) {
-      const vector<Rec> &recs = parts_[part];
-      for (size_t i = 0; i < recs.size(); i++)
-        bad += T.GetByHash(recs[i].h) !=
-               (part >= K ? 0 : exact ? recs[i].taxid : expect[part][i]);
-    }
-    if (bad)
-      errx(EX_SOFTWARE, "blocked table self-check failed for %llu keys",
-           (unsigned long long) bad);
-  }
-
-  clock.mark("self-check");
-  FILE *f = fopen(filename, "wb");
-  if (! f)
-    err(EX_CANTCREAT, "unable to create %s", filename);
+  off_t off = (off_t) (BLOCKED_TABLE_HEADER_BYTES + bucket_bytes);
+  auto put = [&](const void *buf, size_t n) {
+    if (! pwrite_fully(fd, buf, n, off))
+      fail("error writing");
+    off += n;
+  };
+  put(offsets.data(), offsets.size() * sizeof(uint64_t));
+  put(skeys.data(), skeys.size() * sizeof(uint64_t));
+  put(svals.data(), svals.size() * sizeof(uint32_t));
+  put(code_taxa.data(), code_taxa.size() * sizeof(uint32_t));
   vector<char> pad(BLOCKED_TABLE_HEADER_BYTES, 0);
   memcpy(pad.data(), &hdr, sizeof(hdr));
-  bool ok = fwrite(pad.data(), 1, pad.size(), f) == pad.size();
-  ok = ok && fwrite(table, 1, bucket_bytes, f) == bucket_bytes;
-  ok = ok && fwrite(offsets.data(), sizeof(uint64_t), offsets.size(), f) == offsets.size();
-  if (! skeys.empty()) {
-    ok = ok && fwrite(skeys.data(), sizeof(uint64_t), skeys.size(), f) == skeys.size();
-    ok = ok && fwrite(svals.data(), sizeof(uint32_t), svals.size(), f) == svals.size();
-  }
-  ok = ok && fwrite(code_taxa.data(), sizeof(uint32_t), code_taxa.size(), f) == code_taxa.size();
-  ok = (fclose(f) == 0) && ok;
-  if (! ok)
+  if (! pwrite_fully(fd, pad.data(), pad.size(), 0))
+    fail("error writing");
+  if (close(fd) != 0)
     err(EX_IOERR, "error writing %s", filename);
-  clock.mark("file write");
-  free(table);
-  clock.mark("free table");
+  clock.mark("file tail");
 
-  // Records whose own taxon differs from the LCA they now share.
-  uint64_t merged_changed = 0;
-  if (! exact)
-    for (uint64_t part = 0; part < K; part++)
-      for (size_t i = 0; i < parts_[part].size(); i++)
-        merged_changed += parts_[part][i].taxid != expect[part][i];
   std::cerr << "Blocked table: " << N << " keys";
   if (! exact)
     std::cerr << " in " << entries << " entries (" << merged_changed
               << " keys with a merged taxon)";
-  uint64_t kept_keys = 0;
-  for (uint64_t part = 0; part < K; part++)
-    kept_keys += parts_[part].size();
   if (K < P)
     std::cerr << ", " << kept_keys << " kept in " << K << " of " << P
               << " partitions";
