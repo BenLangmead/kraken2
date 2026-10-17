@@ -316,6 +316,8 @@ class BlockedTableBuilder {
   private:
   void Append(size_t part, std::vector<Rec> &recs);
   void Reduce(std::vector<Rec> &v);
+  void ReduceTail(std::vector<Rec> &v, size_t from);
+  void FinishPartition(size_t part);
   void Gather(std::vector<Rec> &dst, std::vector<std::vector<Rec> > &chunks);
 
   uint64_t pext_mask_;

@@ -378,9 +378,14 @@ void BlockedTableBuilder::Buffer::Flush() {
 // Sorts by hash and merges duplicates by LCA.  The result depends only on
 // the multiset of records.
 void BlockedTableBuilder::Reduce(vector<Rec> &v) {
-  std::sort(v.begin(), v.end(), [](const Rec &a, const Rec &b) { return a.h < b.h; });
-  size_t o = 0;
-  for (size_t i = 0; i < v.size(); ) {
+  ReduceTail(v, 0);
+}
+
+// Reduces v[from..] as Reduce does and leaves v[..from) alone.
+void BlockedTableBuilder::ReduceTail(vector<Rec> &v, size_t from) {
+  std::sort(v.begin() + from, v.end(), [](const Rec &a, const Rec &b) { return a.h < b.h; });
+  size_t o = from;
+  for (size_t i = from; i < v.size(); ) {
     uint64_t h = v[i].h;
     uint64_t t = 0;
     while (i < v.size() && v[i].h == h)
@@ -390,6 +395,43 @@ void BlockedTableBuilder::Reduce(vector<Rec> &v) {
     o++;
   }
   v.resize(o);
+}
+
+// Finishes a partition after the scan.  Its first reduced_size_ records are
+// what its last reduction left, sorted and distinct, so only the records
+// appended since are reduced, and the two runs are merged by LCA into a
+// vector of exactly the result's size.  The result is what Reduce would give.
+void BlockedTableBuilder::FinishPartition(size_t part) {
+  vector<Rec> &v = parts_[part];
+  Gather(v, pending_[part]);
+  const size_t a = std::min(reduced_size_[part], v.size());
+  ReduceTail(v, a);
+  const size_t m = v.size();
+  size_t n = 0;
+  for (size_t i = 0, j = a; i < a || j < m; n++) {
+    if (j == m || (i < a && v[i].h < v[j].h))
+      i++;
+    else if (i == a || v[j].h < v[i].h)
+      j++;
+    else {
+      i++;
+      j++;
+    }
+  }
+  vector<Rec> out;
+  out.reserve(n);
+  for (size_t i = 0, j = a; i < a || j < m; ) {
+    if (j == m || (i < a && v[i].h < v[j].h))
+      out.push_back(v[i++]);
+    else if (i == a || v[j].h < v[i].h)
+      out.push_back(v[j++]);
+    else {
+      Rec rec = v[i++];
+      rec.taxid = (uint32_t) tax_.LowestCommonAncestor(rec.taxid, v[j++].taxid);
+      out.push_back(rec);
+    }
+  }
+  v.swap(out);
 }
 
 // Appends the chunks to dst, freeing each one as it is copied.  dst grows
@@ -518,9 +560,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
   // taxon, so the reduced partitions are checked here.
   #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
   for (uint64_t part = 0; part < (uint64_t) parts_.size(); part++) {
-    Gather(parts_[part], pending_[part]);
-    Reduce(parts_[part]);
-    parts_[part].shrink_to_fit();
+    FinishPartition(part);
     for (auto &rec : parts_[part])
       if (rec.taxid >> taxonomy_bits || rec.taxid >= tax_.node_count())
         errx(EX_SOFTWARE, "taxon %u does not fit in %d bits", rec.taxid, taxonomy_bits);
@@ -859,7 +899,11 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     // Bounded breadth-first search for augmenting paths: move placed
     // entries between their two buckets to free a slot.  Entries are handled
     // in a fixed order by one thread per partition, so the result depends
-    // only on the key set.
+    // only on the key set.  The search ends at the first bucket in queue
+    // order with a free slot.  Counts do not change during a search, so it
+    // tests each bucket as it is queued and stops at the first with room,
+    // which is the bucket it would have reached by expanding the queue up
+    // to it.  Expansion stops once AUGMENT_LIMIT buckets are queued.
     vector<uint32_t> stash_idx;
     if (! left.empty()) {
       std::sort(left.begin(), left.end());
@@ -872,22 +916,26 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
         touched.clear();
         uint32_t h0 = home_of(k), a0 = alt_of(k);
         uint32_t starts[2] = {h0, a0};
-        for (int si = 0; si < 2; si++) {
+        int64_t found = -1;
+        for (int si = 0; si < 2 && found < 0; si++) {
           uint32_t s0 = starts[si];
           if (from_bucket[s0] != -2) continue;
           from_bucket[s0] = -1;
           touched.push_back(s0);
           queue.push_back(s0);
+          if (cnt[s0] < S)
+            found = s0;
         }
-        int64_t found = -1;
         for (size_t qi = 0; qi < queue.size() && found < 0; qi++) {
+          if (touched.size() >= (size_t) AUGMENT_LIMIT)
+            break;
           uint32_t X = queue[qi];
           const int c = cnt[X];
-          if (c < S) { found = X; break; }
-          if (touched.size() >= (size_t) AUGMENT_LIMIT) continue;
           const Slot *sx = &slot[(size_t) X * S];
-          for (int s = 0; s < c; s++)
+          for (int s = 0; s < c; s++) {
             __builtin_prefetch(&from_bucket[sx[s].other]);
+            __builtin_prefetch(&cnt[sx[s].other]);
+          }
           for (int s = 0; s < c; s++) {
             uint32_t Y = sx[s].other;
             if (from_bucket[Y] != -2) continue;
@@ -895,7 +943,10 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
             via_entry[Y] = sx[s].i;
             touched.push_back(Y);
             queue.push_back(Y);
-            __builtin_prefetch(&cnt[Y]);
+            if (cnt[Y] < S) {
+              found = Y;
+              break;
+            }
             __builtin_prefetch(&slot[(size_t) Y * S]);
             __builtin_prefetch(&slot[(size_t) Y * S + S - 1]);
           }
