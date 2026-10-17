@@ -62,6 +62,7 @@
 
 #include <chrono>
 #include <fcntl.h>
+#include <future>
 
 using std::string;
 using std::vector;
@@ -79,7 +80,7 @@ struct Options {
   vector<int> read_lengths;
   vector<string> inputs;
   int threads = 1;
-  size_t chunk = 1 << 20;            // window start positions per chunk
+  size_t chunk = 1 << 16;            // window start positions per chunk
   size_t block_bytes = 64 << 20;     // input bytes per block
   bool naive = false;                // score every window from scratch
   bool memory_mapping = false;
@@ -406,7 +407,7 @@ void Usage(int code) {
     "  -O PREFIX output prefix, for example DB/database\n"
     "  -r LIST   read lengths, comma-separated (default 100)\n"
     "  -p N      threads (default 1)\n"
-    "  -c N      window start positions per chunk (default 1048576)\n"
+    "  -c N      window start positions per chunk (default 65536)\n"
     "  -B N      input block bytes (default 67108864)\n"
     "  -M        memory-map the table\n"
     "  -X        score every window from scratch (testing)\n";
@@ -605,9 +606,21 @@ int main(int argc, char **argv) {
       err(EX_NOINPUT, "unable to open %s", path.c_str());
     StreamCursor cursor;
     bool have = PrimeStream(fd, cursor);
-    FastReader reader;
-    while (have && reader.LoadBlock(fd, cursor, opts.block_bytes)) {
-      reader.Parse();
+    // Two readers: the next block is read and parsed while the threads score
+    // the current one.
+    FastReader readers[2];
+    auto load = [&](FastReader &r) {
+      if (! have || ! r.LoadBlock(fd, cursor, opts.block_bytes))
+        return false;
+      r.Parse();
+      return true;
+    };
+    int cur = 0;
+    bool loaded = load(readers[cur]);
+    while (loaded) {
+      FastReader &reader = readers[cur];
+      std::future<bool> next = std::async(std::launch::async, load,
+                                          std::ref(readers[cur ^ 1]));
       size_t nseq = reader.size();
       vector<int64_t> genome(nseq, -1);
       vector<Unit> units;
@@ -721,6 +734,8 @@ int main(int argc, char **argv) {
           dists[li].Fold(genome[i], v);
         }
       }
+      loaded = next.get();
+      cur ^= 1;
     }
     if (! cursor.error.empty())
       errx(EX_IOERR, "%s (%s)", cursor.error.c_str(), path.c_str());
