@@ -331,8 +331,8 @@ BlockedTableBuilder::BlockedTableBuilder(uint64_t pext_mask, int partition_bits,
       p_(partition_bits < 0 ? BLOCKED_AUTO_MAX_BITS : partition_bits),
       auto_p_(partition_bits < 0), load_(load),
       remainder_bits_(remainder_bits), kept_(kept_partitions), tax_(tax),
-      parts_(1ULL << p_), reduced_size_(1ULL << p_, 0),
-      locks_(1ULL << p_) {
+      parts_(1ULL << p_), pending_(1ULL << p_), reduced_size_(1ULL << p_, 0),
+      busy_(1ULL << p_, 0), locks_(1ULL << p_) {
   pext_.init(pext_mask);
   B_ = pext_.width;
   if (B_ > 62 || B_ < p_ + 8)
@@ -392,16 +392,69 @@ void BlockedTableBuilder::Reduce(vector<Rec> &v) {
   v.resize(o);
 }
 
+// Appends the chunks to dst, freeing each one as it is copied.  dst grows
+// geometrically, as it would by repeated insertion.
+void BlockedTableBuilder::Gather(vector<Rec> &dst, vector<vector<Rec> > &chunks) {
+  size_t n = dst.size();
+  for (auto &c : chunks)
+    n += c.size();
+  if (n > dst.capacity())
+    dst.reserve(std::max(n, 2 * dst.size()));
+  for (auto &c : chunks) {
+    dst.insert(dst.end(), c.begin(), c.end());
+    vector<Rec>().swap(c);
+  }
+  chunks.clear();
+}
+
+// Adds the buffer's records to the partition and leaves recs empty.  Only
+// short steps happen under the partition's lock: a copy into spare capacity,
+// or moving recs onto the pending list.  When the partition must grow, or
+// has doubled since its last reduction (which keeps memory near the
+// distinct-key count), the thread that found it takes the run out of the
+// partition and grows or reduces it outside the lock.  Records that arrive
+// meanwhile wait on the pending list and are added before the run goes
+// back.
 void BlockedTableBuilder::Append(size_t part, vector<Rec> &recs) {
-  std::lock_guard<std::mutex> g(locks_[part]);
-  vector<Rec> &dst = parts_[part];
-  dst.insert(dst.end(), recs.begin(), recs.end());
+  vector<Rec> run;
+  bool reduce;
+  {
+    std::lock_guard<std::mutex> g(locks_[part]);
+    if (busy_[part]) {
+      pending_[part].emplace_back(std::move(recs));
+      recs = vector<Rec>();
+      return;
+    }
+    vector<Rec> &dst = parts_[part];
+    const size_t n = dst.size() + recs.size();
+    reduce = n > 2 * std::max(reduced_size_[part], (size_t) 1 << 20);
+    if (! reduce && n <= dst.capacity()) {
+      dst.insert(dst.end(), recs.begin(), recs.end());
+      recs.clear();
+      return;
+    }
+    busy_[part] = 1;
+    run.swap(dst);
+  }
+  run.insert(run.end(), recs.begin(), recs.end());
   recs.clear();
-  // Keep memory near the distinct-key count by reducing whenever the
-  // partition has doubled since its last reduction.
-  if (dst.size() > 2 * std::max(reduced_size_[part], (size_t) 1 << 20)) {
-    Reduce(dst);
-    reduced_size_[part] = dst.size();
+  if (reduce)
+    Reduce(run);
+  const size_t reduced = run.size();
+  vector<vector<Rec> > chunks;
+  while (true) {
+    {
+      std::lock_guard<std::mutex> g(locks_[part]);
+      if (pending_[part].empty()) {
+        parts_[part].swap(run);
+        if (reduce)
+          reduced_size_[part] = reduced;
+        busy_[part] = 0;
+        return;
+      }
+      chunks.swap(pending_[part]);
+    }
+    Gather(run, chunks);
   }
 }
 
@@ -417,6 +470,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
 
   #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
   for (uint64_t part = 0; part < (uint64_t) parts_.size(); part++) {
+    Gather(parts_[part], pending_[part]);
     Reduce(parts_[part]);
     parts_[part].shrink_to_fit();
   }
