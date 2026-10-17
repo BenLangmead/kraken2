@@ -458,6 +458,34 @@ void BlockedTableBuilder::Append(size_t part, vector<Rec> &recs) {
   }
 }
 
+// Times of the stages of Write(), printed to stderr when K2_BLOCKED_TIMES is
+// set: each stage's wall time, and for placement the core time of its steps
+// summed over partitions and when each thread ran out of partitions.
+namespace {
+struct StageClock {
+  typedef std::chrono::steady_clock Clock;
+  bool on;
+  Clock::time_point t0, last;
+  StageClock() : on(getenv("K2_BLOCKED_TIMES") != nullptr), t0(Clock::now()), last(t0) {
+    if (on)
+      fprintf(stderr, "\n[blocked times] start\n");
+  }
+  double now() const { return std::chrono::duration<double>(Clock::now() - t0).count(); }
+  void mark(const char *stage) {
+    if (! on)
+      return;
+    Clock::time_point t = Clock::now();
+    fprintf(stderr, "[blocked times] %-20s %9.2f s, at %9.2f s\n", stage,
+            std::chrono::duration<double>(t - last).count(),
+            std::chrono::duration<double>(t - t0).count());
+    last = t;
+  }
+};
+const int PLACE_STEPS = 7;
+const char *const PLACE_STEP_NAMES[PLACE_STEPS] = {
+  "entries", "natives", "overflow sort", "alt", "augment", "stash", "pack"};
+}
+
 static inline void set_bits(uint64_t *b, int off, int len, uint64_t val) {
   int wi = off >> 6, bi = off & 63;
   b[wi] |= val << bi;
@@ -467,6 +495,7 @@ static inline void set_bits(uint64_t *b, int off, int len, uint64_t val) {
 
 uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int threads) {
   const int AUGMENT_LIMIT = 2000;  // buckets visited per augmenting search
+  StageClock clock;
 
   #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
   for (uint64_t part = 0; part < (uint64_t) parts_.size(); part++) {
@@ -474,6 +503,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     Reduce(parts_[part]);
     parts_[part].shrink_to_fit();
   }
+  clock.mark("final reduce");
   uint64_t N = 0;
   for (auto &v : parts_)
     N += v.size();
@@ -504,6 +534,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
       p_ = p;
     }
   }
+  clock.mark("key count, merge");
   const uint64_t P = parts_.size();
   const uint64_t K = kept_ ? kept_ : P;
   const int q = B_ - p_;
@@ -511,6 +542,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     for (auto &rec : parts_[part])
       if (rec.taxid >> taxonomy_bits || rec.taxid >= tax_.node_count())
         errx(EX_SOFTWARE, "taxon %u does not fit in %d bits", rec.taxid, taxonomy_bits);
+  clock.mark("taxon check");
 
   // Entries of one partition as (home << r | rem, internal taxon), sorted
   // and distinct.  In exact mode recs are sorted by hash, and home and rem
@@ -644,6 +676,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     value_bits = vb;
   }
   const bool exact = r >= r_exact;
+  clock.mark("count taxa");
   if (S > 127)
     errx(EX_SOFTWARE, "blocked table bucket would hold %d slots", S);
 
@@ -671,6 +704,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
   if (posix_memalign((void **) &table, (size_t) 1 << 21, bucket_bytes) != 0)
     errx(EX_OSERR, "unable to allocate %zu bytes for the blocked table", bucket_bytes);
   memset(table, 0, bucket_bytes);
+  clock.mark("codes, allocate");
 
   vector<vector<uint64_t> > stash_keys(K);
   vector<vector<uint32_t> > stash_vals(K);
@@ -678,15 +712,28 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
   // Fingerprint mode: the taxon each record's lookup must return, which is
   // the LCA of every record sharing its (home, rem).
   vector<vector<uint32_t> > expect(exact ? 0 : K);
+  vector<double> step_time(clock.on ? K * PLACE_STEPS : 0, 0);
+  vector<double> thread_done(clock.on ? threads : 0, 0);
+  vector<uint64_t> over_ct(K, 0), left_ct(K, 0);
 
   #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
   for (uint64_t part = 0; part < K; part++) {
+    double t_step = clock.on ? clock.now() : 0;
+    auto step = [&](int k) {
+      if (! clock.on)
+        return;
+      double t = clock.now();
+      step_time[part * PLACE_STEPS + k] = t - t_step;
+      t_step = t;
+      thread_done[omp_get_thread_num()] = t;
+    };
     // Entries as (home << r | rem, taxon code), sorted.
     vector<pair<uint64_t, uint32_t> > e;
     make_entries(part, r, nb, exact, e, exact ? nullptr : &expect[part]);
     for (auto &x : e)
       x.second = taxon_code[x.second];
     stored[part] = e.size();
+    step(0);
     uint64_t base = part * nb;
     // Placement on a flat slot array: cnt[b] entries of bucket b live in
     // slot[b*S .. b*S+cnt[b]), as indices into e; at_alt[i] says whether
@@ -719,6 +766,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
       }
       i = j;
     }
+    step(1);
     // Overflow goes to alt buckets in (alt, rem, index) order while they
     // have room.
     std::sort(over.begin(), over.end(), [&](uint32_t a, uint32_t b) {
@@ -727,6 +775,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
       uint64_t ra = e[a].first & rmask, rb = e[b].first & rmask;
       return ra != rb ? ra < rb : a < b;
     });
+    step(2);
     vector<uint32_t> left;
     for (auto i : over) {
       uint64_t a = alt_of(i);
@@ -738,6 +787,9 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
         left.push_back(i);
       }
     }
+    over_ct[part] = over.size();
+    left_ct[part] = left.size();
+    step(3);
     // Bounded breadth-first search for augmenting paths: move placed
     // entries between their two buckets to free a slot.  Entries are handled
     // in a fixed order by one thread per partition, so the result depends
@@ -798,6 +850,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
           from_bucket[b] = -2;
       }
     }
+    step(4);
     // Stash, sorted by (home, rem).
     std::sort(stash_idx.begin(), stash_idx.end());
     for (auto i : stash_idx) {
@@ -805,6 +858,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
       stash_vals[part].push_back(e[i].second);
       spill[home_of(i)] |= 1ULL << sbit(i);
     }
+    step(5);
     // Pack each bucket: natives by remainder, then guests by (rem, index).
     uint64_t g_ct = 0, sp = 0;
     vector<uint32_t> nat_l, gst_l;
@@ -844,6 +898,38 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
     }
     guests[part] = g_ct;
     spilled[part] = sp;
+    step(6);
+  }
+  clock.mark("placement");
+  if (clock.on) {
+    for (int k = 0; k < PLACE_STEPS; k++) {
+      double sum = 0, mx = 0;
+      for (uint64_t part = 0; part < K; part++) {
+        sum += step_time[part * PLACE_STEPS + k];
+        mx = std::max(mx, step_time[part * PLACE_STEPS + k]);
+      }
+      fprintf(stderr, "[blocked times]   %-18s %9.1f core s, max %7.2f s\n",
+              PLACE_STEP_NAMES[k], sum, mx);
+    }
+    double mx = 0;
+    for (uint64_t part = 0; part < K; part++) {
+      double t = 0;
+      for (int k = 0; k < PLACE_STEPS; k++)
+        t += step_time[part * PLACE_STEPS + k];
+      mx = std::max(mx, t);
+    }
+    uint64_t over_sum = 0, left_sum = 0;
+    for (uint64_t part = 0; part < K; part++) {
+      over_sum += over_ct[part];
+      left_sum += left_ct[part];
+    }
+    fprintf(stderr, "[blocked times]   %llu overflow entries, %llu left for the augmenting search\n",
+            (unsigned long long) over_sum, (unsigned long long) left_sum);
+    std::sort(thread_done.begin(), thread_done.end());
+    fprintf(stderr, "[blocked times]   longest partition %.2f s; threads ran out of partitions at", mx);
+    for (double t : thread_done)
+      fprintf(stderr, " %.1f", t);
+    fprintf(stderr, "\n");
   }
 
   // Flatten the stash.
@@ -880,6 +966,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
   }
   hdr.taxon_codes = U;
 
+  clock.mark("flatten stash");
   // Self-check: every key must come back with its own taxon (in fingerprint
   // mode, the LCA of its entry) through the same lookup code classify uses,
   // and every key of a dropped partition must miss.
@@ -905,6 +992,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
            (unsigned long long) bad);
   }
 
+  clock.mark("self-check");
   FILE *f = fopen(filename, "wb");
   if (! f)
     err(EX_CANTCREAT, "unable to create %s", filename);
@@ -921,7 +1009,9 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
   ok = (fclose(f) == 0) && ok;
   if (! ok)
     err(EX_IOERR, "error writing %s", filename);
+  clock.mark("file write");
   free(table);
+  clock.mark("free table");
 
   // Records whose own taxon differs from the LCA they now share.
   uint64_t merged_changed = 0;
@@ -950,6 +1040,7 @@ uint64_t BlockedTableBuilder::Write(const char *filename, int taxonomy_bits, int
             << " bits/key, load " << (double) entries / (K * nb * S)
             << ", guests " << hdr.guests << ", stash " << hdr.stash_entries
             << std::endl;
+  clock.mark("report");
   return N;
 }
 
