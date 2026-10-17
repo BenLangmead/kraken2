@@ -5,6 +5,7 @@
  */
 
 #include "aa_translate.h"
+#include <cstdint>
 
 using std::string;
 using std::vector;
@@ -38,6 +39,20 @@ static char translation_map[] = "KKNNRRSSTTTTIMIIEEDDGGGGAAAAVVVVQQHHRRRRPPPPLLL
 static uint8_t fwd_lookup_table[UINT8_MAX + 1] = {0};
 static uint8_t rev_lookup_table[UINT8_MAX + 1] = {0};
 
+void initLookUpTables() {
+  for (size_t i = 0; i <= UINT8_MAX; i++)
+    fwd_lookup_table[i] = rev_lookup_table[i] = UINT8_MAX;
+  // Map is based on AGCT coding, not ACGT
+  fwd_lookup_table[(int) 'A'] = fwd_lookup_table[(int) 'a'] = 0x00;
+  fwd_lookup_table[(int) 'G'] = fwd_lookup_table[(int) 'g'] = 0x01;
+  fwd_lookup_table[(int) 'C'] = fwd_lookup_table[(int) 'c'] = 0x02;
+  fwd_lookup_table[(int) 'T'] = fwd_lookup_table[(int) 't'] = 0x03;
+  rev_lookup_table[(int) 'A'] = rev_lookup_table[(int) 'a'] = 0x30;
+  rev_lookup_table[(int) 'G'] = rev_lookup_table[(int) 'g'] = 0x20;
+  rev_lookup_table[(int) 'C'] = rev_lookup_table[(int) 'c'] = 0x10;
+  rev_lookup_table[(int) 'T'] = rev_lookup_table[(int) 't'] = 0x00;
+}
+
 void TranslateToAllFrames(const char *dna_seq, size_t len,
                           vector<string> &aa_seqs) {
   auto max_size = (len / 3) + 1;
@@ -45,20 +60,6 @@ void TranslateToAllFrames(const char *dna_seq, size_t len,
     aa_seqs[i].assign(max_size, ' ');
   if (len < 3)
     return;
-
-  if (fwd_lookup_table[0] == 0) {
-    for (size_t i = 0; i <= UINT8_MAX; i++)
-      fwd_lookup_table[i] = rev_lookup_table[i] = UINT8_MAX;
-    // Map is based on AGCT coding, not ACGT
-    fwd_lookup_table[(int) 'A'] = fwd_lookup_table[(int) 'a'] = 0x00;
-    fwd_lookup_table[(int) 'G'] = fwd_lookup_table[(int) 'g'] = 0x01;
-    fwd_lookup_table[(int) 'C'] = fwd_lookup_table[(int) 'c'] = 0x02;
-    fwd_lookup_table[(int) 'T'] = fwd_lookup_table[(int) 't'] = 0x03;
-    rev_lookup_table[(int) 'A'] = rev_lookup_table[(int) 'a'] = 0x30;
-    rev_lookup_table[(int) 'G'] = rev_lookup_table[(int) 'g'] = 0x20;
-    rev_lookup_table[(int) 'C'] = rev_lookup_table[(int) 'c'] = 0x10;
-    rev_lookup_table[(int) 'T'] = rev_lookup_table[(int) 't'] = 0x00;
-  }
 
   uint8_t fwd_codon = 0, rev_codon = 0;
   int ambig_nt_countdown = 0;  // if positive, bases to go until N leaves codon

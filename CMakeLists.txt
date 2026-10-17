@@ -6,7 +6,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_compile_options(-Wall)
@@ -27,5 +27,17 @@ find_package(Threads REQUIRED)
 find_library(MATH m REQUIRED)
 find_package(ZLIB REQUIRED)
 include_directories(${ZLIB_INCLUDE_DIRS})
+
+# Indexed BGZF input (classify -Z) inflates with libdeflate when it is
+# installed, and with zlib otherwise.
+find_library(DEFLATE_LIBRARY deflate)
+find_path(DEFLATE_INCLUDE_DIR libdeflate.h)
+if(DEFLATE_LIBRARY AND DEFLATE_INCLUDE_DIR)
+    include_directories(${DEFLATE_INCLUDE_DIR})
+    set(INFLATE_LIBRARIES ${DEFLATE_LIBRARY})
+else()
+    add_definitions(-DKRAKEN2_ZLIB_INFLATE)
+    set(INFLATE_LIBRARIES ${ZLIB_LIBRARIES})
+endif()
 
 add_subdirectory(src)

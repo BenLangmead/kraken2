@@ -10,6 +10,7 @@
 #include "kraken2_headers.h"
 
 namespace kraken2 {
+void initLookUpTables();
 
 // Translates a span of bases into all six reading frames.  Takes a pointer and
 // length rather than a string so callers holding a view into a read buffer do

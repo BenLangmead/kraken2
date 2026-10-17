@@ -489,7 +489,7 @@ void HyperLogLogPlusMinus<HASH>::dumpHLL(FILE *f) {
   // Maybe enum?
 
   // sparse list
-  int sparse_written = fwrite(&sparse, sizeof(sparse), 1, f);
+  fwrite(&sparse, sizeof(sparse), 1, f);
   if (sparse) {
     auto sparseList_length = sparseList.size();
     fwrite(&sparseList_length, sizeof(sparseList_length), 1, f);
@@ -539,7 +539,7 @@ void HyperLogLogPlusMinus<uint64_t>::insert(uint64_t item) {
 
     if (sparse && this->sparseList.size() + 1 > this->m/4) {
        switchToNormalRepresentation();
-     }
+    }
     if (sparse) {
       // sparse mode: put the encoded hash into sparse list
       uint32_t encoded_hash_value = encodeHashIn32Bit(hash_value, pPrime, p);
@@ -646,6 +646,9 @@ void HyperLogLogPlusMinus<T>::merge(HyperLogLogPlusMinus<T>&& other) {
         // this->merge(static_cast<const HyperLogLogPlusMinus<T>&>(other));
         // consider using addHashToSparseList(this->sparseList, val, pPrime) and checking for sizes
         this->sparseList.insert(other.sparseList.begin(), other.sparseList.end());
+        // As on insert, switch to the dense registers once the list passes m/4.
+        if (this->sparseList.size() > this->m / 4)
+          switchToNormalRepresentation();
       } else if (other.sparse) {
         // other is sparse, but this is not
         addToRegisters(other.sparseList);
@@ -687,6 +690,9 @@ void HyperLogLogPlusMinus<T>::merge(const HyperLogLogPlusMinus<T>& other) {
       if (this->sparse && other.sparse) {
         // consider using addHashToSparseList(this->sparseList, val, pPrime) and checking for sizes
         this->sparseList.insert(other.sparseList.begin(), other.sparseList.end());
+        // As on insert, switch to the dense registers once the list passes m/4.
+        if (this->sparseList.size() > this->m / 4)
+          switchToNormalRepresentation();
       } else if (other.sparse) {
         // other is sparse, but this is not
         addToRegisters(other.sparseList);

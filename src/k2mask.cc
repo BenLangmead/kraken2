@@ -5,23 +5,41 @@
 
 #include <algorithm>
 #include <deque>
+#include <fstream>
 #include <functional>
-#include <future>
 #include <iostream>
+#include <iterator>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <queue>
+#include <thread>
 
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <zlib.h>
 
-#include "gzstream.h"
-#include "seqreader.h"
-#include "threadpool.h"
+#include "fast_reader.h"
 
 using namespace kraken2;
+
+// input_lock serializes reads from the input stream. output_lock guards the
+// output stream, pending_blocks and next_output_block, so blocks are written
+// in input order.
+static std::mutex input_lock;
+static std::mutex output_lock;
+static std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> pending_blocks;
+static size_t next_output_block = 0;
+
+// Directory for blocks that finish masking before the blocks ahead of them
+// have been written. Spilling them to disk bounds memory use.
+static std::string spill_dir;
 
 uint8_t asc2dna[] = {
   /*   0 */ 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
@@ -46,6 +64,8 @@ uint8_t asc2dna[] = {
   /* 224 */ 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
   /* 240 */ 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
 };
+
+static const size_t INPUT_BLOCK_BYTES = 8 * 1024 * 1024;
 
 struct PerfectInterval {
   int start;
@@ -77,7 +97,7 @@ struct SDust {
   std::deque<int> kmers;
   std::vector<PerfectInterval> perfectIntervals;
   std::vector<MaskRange> ranges;
-  Sequence seq;
+  SeqView *seq;
   int cw[64];
   int cv[64];
   int rw;
@@ -223,46 +243,126 @@ void runSymmetricDust(SDust &sd, char *seq, size_t size, int offset) {
     saveMaskedRegions(sd, windowStart++);
 }
 
-void printFasta(Sequence& seq, std::ostream &out, int width) {
+void printSequence(SeqView *seq, std::ostream &out, int width) {
   out << ">";
-  out.write(&seq.header[0], seq.header.size());
-  if (seq.comment.size() > 0) {
+  out.write(seq->header, seq->header_len);
+  if (seq->comment_len) {
     out << " ";
-    out.write(&seq.comment[0], seq.comment.size());
+    out.write(seq->comment, seq->comment_len);
   }
-  out << '\n';
-  for (size_t i = 0; i < seq.seq.size(); i += width) {
-    if (i + width >= seq.seq.size())
-      width = seq.seq.size() - i;
-    out.write(&seq.seq[i], width);
+  out << "\n";
+  for (size_t i = 0; i < seq->seq_len; i += width) {
+    if (i + width >= seq->seq_len)
+      width = seq->seq_len - i;
+    out.write(seq->seq + i, width);
     out << '\n';
   }
-  out.flush();
 }
 
-SDust *mask(SDust *sd) {
+void mask(SDust &sd) {
   size_t i = 0;
-  std::string &seq = sd->seq.seq;
+  char *seq = sd.seq->seq_mutable();
+  size_t seq_len = sd.seq->seq_len;
 
-  for (; i < seq.size(); i++) {
+  for (; i < seq_len; i++) {
     if (asc2dna[(int)seq[i]] != 4) {
       int start = i;
       for (;;) {
         seq[i] = toupper(seq[i]);
-        if ((i + 1) == seq.size() || asc2dna[(int)seq[i + 1]] == 4)
+        if ((i + 1) == seq_len || asc2dna[(int)seq[i + 1]] == 4)
           break;
         i++;
       }
       char *s = &seq[0] + start;
-      runSymmetricDust(*sd, s, i - start + 1, start);
-      for (size_t j = 0; j < sd->ranges.size(); j++) {
-        for (int i = sd->ranges[j].start; i < sd->ranges[j].finish; i++)
+      runSymmetricDust(sd, s, i - start + 1, start);
+      for (size_t j = 0; j < sd.ranges.size(); j++) {
+        for (int i = sd.ranges[j].start; i < sd.ranges[j].finish; i++)
           s[i] = processMaskedNucleotide(s[i]);
       }
-      sd->reset();
+      sd.reset();
     }
   }
-  return sd;
+}
+
+void flushOutput(FastReader &reader, std::ostream &out, size_t width) {
+  for (size_t i = 0; i < reader.size(); i++) {
+    printSequence(&reader.at(i), out, width);
+  }
+}
+
+std::string spillPath(size_t block_number) {
+  return spill_dir + "/block." + std::to_string(block_number);
+}
+
+void fail(const std::string &what) {
+  std::cerr << "k2mask: " << what << ": " << strerror(errno) << std::endl;
+  std::exit(1);
+}
+
+// Writes every spilled block that is next in input order.  The caller holds
+// output_lock.
+void writeReadySpilledBlocks(std::ostream &out) {
+  while (!pending_blocks.empty() && pending_blocks.top() == next_output_block) {
+    std::string path = spillPath(next_output_block);
+    {
+      std::ifstream in(path, std::ios::binary);
+      if (!in)
+        fail("cannot open " + path);
+      // Inserting an empty streambuf would set failbit on out.
+      if (in.peek() != std::ifstream::traits_type::eof())
+        out << in.rdbuf();
+    }
+    std::remove(path.c_str());
+    pending_blocks.pop();
+    next_output_block++;
+  }
+}
+
+void processInput(int fd, StreamCursor &cursor, std::ostream &out, int width,
+                  size_t &input_block_number) {
+  FastReader reader;
+  SDust sd;
+
+  while (true) {
+    size_t block_number;
+    {
+      std::lock_guard<std::mutex> lg(input_lock);
+      if (!reader.LoadBlock(fd, cursor, INPUT_BLOCK_BYTES))
+        break;
+      block_number = input_block_number++;
+    }
+
+    reader.Parse();
+    for (size_t i = 0; i < reader.size(); i++) {
+      sd.seq = &reader.at(i);
+      mask(sd);
+      sd.reset();
+    }
+
+    // Write the block directly if it is next and the output is free;
+    // otherwise spill it and let whichever thread reaches it write it.
+    {
+      std::unique_lock<std::mutex> lk(output_lock, std::try_to_lock);
+      if (lk.owns_lock() && block_number == next_output_block) {
+        flushOutput(reader, out, width);
+        next_output_block++;
+        writeReadySpilledBlocks(out);
+        continue;
+      }
+    }
+
+    std::string path = spillPath(block_number);
+    {
+      std::ofstream temp(path, std::ios::binary | std::ios::trunc);
+      flushOutput(reader, temp, width);
+      temp.close();
+      if (!temp)
+        fail("cannot write " + path);
+    }
+    std::lock_guard<std::mutex> lk(output_lock);
+    pending_blocks.push(block_number);
+    writeReadySpilledBlocks(out);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -320,9 +420,8 @@ int main(int argc, char **argv) {
       outfile = optarg;
       break;
     case 't':
-      // Number of threads. If _n_ threads are specified,
-      // _n - 1_ threads will be used for masking and the
-      // final thread used to manage I/O.
+      // Number of threads. Each thread reads, masks and writes whole
+      // blocks; output stays in input order.
       threads = atoi(optarg);
       break;
     case 'r': {
@@ -350,37 +449,52 @@ int main(int argc, char **argv) {
   }
   auto outputFileMode = std::ios::out | std::ios::trunc;
   std::ofstream out(outfile, outputFileMode);
-  std::vector<SDust *> sds(threads);
-  for (size_t i = 0; i < sds.size(); i++) {
-    sds[i] = new SDust();
+  if (!out)
+    fail("cannot open " + outfile);
+
+  int fd = infile == "/dev/stdin" ? fileno(stdin) : open(infile.c_str(), O_RDONLY);
+  if (fd < 0)
+    fail("cannot open " + infile);
+  StreamCursor cursor;
+  bool have_input = PrimeStream(fd, cursor);
+  if (!have_input) {
+    return 0;
   }
-  thread_pool pool(threads - 1);
-  std::queue<std::future<SDust *>> tasks;
-  BatchSequenceReader reader(infile.c_str());
-  for (SDust *sd = sds.back(); reader.NextSequence(sd->seq); sd = sds.back()) {
-    sds.pop_back();
-    if (threads > 1) {
-      tasks.push(pool.submit(mask, sd));
-      while (sds.empty()) {
-        sd = tasks.front().get();
-        printFasta(sd->seq, out, lineWidth);
-        tasks.pop();
-        sd->reset();
-        sds.push_back(sd);
-      }
-    } else {
-      mask(sd);
-      printFasta(sd->seq, out, lineWidth);
-      sds.push_back(sd);
-    }
+
+  if (threads < 1)
+    threads = 1;
+  if (threads > 1) {
+    const char *tmpdir = getenv("TMPDIR");
+    std::string tmpl = std::string(tmpdir && *tmpdir ? tmpdir : "/tmp") +
+                       "/k2mask.XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    if (mkdtemp(buf.data()) == NULL)
+      fail("cannot create a temporary directory from " + tmpl);
+    spill_dir = buf.data();
   }
-  while (!tasks.empty()) {
-    SDust *sd = tasks.front().get();
-    printFasta(sd->seq, out, lineWidth);
-    tasks.pop();
+
+  // The calling thread is one of the `threads` masking threads.
+  size_t input_block_number = 0;
+  std::vector<std::thread> workers;
+  workers.reserve(threads - 1);
+  for (auto i = 0; i < threads - 1; i++) {
+    workers.emplace_back(processInput, fd, std::ref(cursor), std::ref(out),
+                         lineWidth, std::ref(input_block_number));
   }
-  for (size_t i = 0; i < sds.size(); i++)
-    delete (sds[i]);
+
+  processInput(fd, cursor, out, lineWidth, input_block_number);
+
+  for (auto &worker : workers) {
+    worker.join();
+  }
+
+  if (!spill_dir.empty())
+    rmdir(spill_dir.c_str());
+
   out.flush();
-  remove("masked_sequences.txt");
+  if (!out)
+    fail("cannot write " + outfile);
+
+  return 0;
 }

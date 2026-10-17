@@ -93,7 +93,8 @@ int main(int argc, char **argv) {
   StreamCursor cur;
   std::vector<uint64_t> mins;
 
-  while (n_reads < limit && reader.LoadBlock(fd, cur, 8 << 20)) {
+  bool have_input = PrimeStream(fd, cur);
+  while (have_input && n_reads < limit && reader.LoadBlock(fd, cur, 8 << 20)) {
     reader.Parse();
     for (size_t i = 0; i < reader.size() && n_reads < limit; i++) {
       const SeqView &s = reader[i];

@@ -32,10 +32,7 @@ MinimizerScanner::MinimizerScanner(ssize_t k, ssize_t l,
   lmer_mask_ <<= (l_ * (dna_ ? BITS_PER_CHAR_DNA : BITS_PER_CHAR_PRO));
   lmer_mask_--;
   toggle_mask_ &= lmer_mask_;
-  // No sequence is loaded yet, so there is nothing to size here; LoadSequence
-  // sets the interval.  The old code dereferenced a null str_ on this path,
-  // reached only when finish_ was SIZE_MAX, which the member initializers made
-  // impossible; removing it drops the latent null dereference.
+  // LoadSequence sets the interval; no sequence is loaded yet.
   for (int i = 0; i < UINT8_MAX + 1; i++)
     lookup_table_[i] = UINT8_MAX;
   if (dna_) {

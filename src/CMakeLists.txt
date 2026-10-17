@@ -4,7 +4,8 @@ add_executable(build_db
         mmap_file.cc
         compact_hash.cc
         taxonomy.cc
-        seqreader.cc
+        fast_reader.cc
+        bgzf_index.cc
         mmscanner.cc
         omp_hack.cc
         utilities.cc)
@@ -12,11 +13,13 @@ add_executable(build_db
 add_executable(classify
         classify.cc
         blocked_table.cc
+        fast_reader.cc
+        bgzf_index.cc
+        k2_profile.cc
         reports.cc
         mmap_file.cc
         compact_hash.cc
         taxonomy.cc
-        seqreader.cc
         mmscanner.cc
         omp_hack.cc
         aa_translate.cc
@@ -25,7 +28,8 @@ add_executable(classify
 
 add_executable(estimate_capacity
         estimate_capacity.cc
-        seqreader.cc
+        fast_reader.cc
+        bgzf_index.cc
         mmscanner.cc
         omp_hack.cc
         utilities.cc)
@@ -47,7 +51,8 @@ add_executable(lookup_accession_numbers
 
 add_executable(k2mask
         k2mask.cc
-        seqreader.cc)
+        fast_reader.cc
+        bgzf_index.cc)
 
 add_executable(blast_to_fasta
         blast_to_fasta.c
@@ -60,5 +65,8 @@ add_library(tax SHARED
        mmap_file.cc
 )
 
-target_link_libraries(k2mask ${ZLIB_LIBRARIES} Threads::Threads)
+target_link_libraries(build_db ${INFLATE_LIBRARIES})
+target_link_libraries(classify ${INFLATE_LIBRARIES})
+target_link_libraries(estimate_capacity ${INFLATE_LIBRARIES})
+target_link_libraries(k2mask ${INFLATE_LIBRARIES} ${ZLIB_LIBRARIES} Threads::Threads)
 target_link_libraries(blast_to_fasta ${MATH})

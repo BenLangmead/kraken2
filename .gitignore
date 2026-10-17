@@ -7,3 +7,5 @@ src/lookup_accession_numbers
 src/k2bgzf
 src/k2mindump
 src/k2mask
+__pycache__/
+*.pyc

@@ -126,12 +126,12 @@ int main(int argc, char **argv) {
 // This function exists to deal with NCBI's use of \x01 characters to denote
 // the start of a new FASTA header in the same line (for non-redundant DBs).
 // We return all sequence IDs in a header line, not just the first.
-vector<string> ExtractNCBISequenceIDs(const string &header) {
+vector<string> ExtractNCBISequenceIDs(const char *header, size_t header_len) {
   vector<string> list;
   string current_str;
   bool in_id = true;
 
-  for (size_t i = 0; i < header.size(); ++i) {
+  for (size_t i = 0; i < header_len; ++i) {
     if (header[i] == 0x01) {
       // 0x01 starts new ID at next char
       if (! current_str.empty())
@@ -406,16 +406,23 @@ void BuildBlockedTable(const Taxonomy &taxonomy,
   for (int t = 0; t < threads; t++)
     buffers[t] = new BlockedTableBuilder::Buffer(builder);
 
-  struct Item { const string *seq; taxid_t taxid; size_t start, finish; };
+  struct Item { const char *seq; size_t len; taxid_t taxid; size_t start, finish; };
   vector<Item> items;
   size_t processed_seq_ct = 0;
   size_t processed_ch_ct = 0;
-  BatchSequenceReader reader;
-  Sequence *sequence;
-  while (reader.LoadBlock(opts.block_size)) {
+  int fd = fileno(stdin);
+  StreamCursor cursor;
+  bool have_input = PrimeStream(fd, cursor);
+  FastReader reader;
+  // Items point into the reader's buffer, so each block is scanned before the
+  // next one is loaded over it.
+  while (have_input && reader.LoadBlock(fd, cursor, opts.block_size)) {
+    reader.Parse();
     items.clear();
-    while ((sequence = reader.NextSequence()) != NULL) {
-      auto all_sequence_ids = ExtractNCBISequenceIDs(sequence->header);
+    for (size_t j = 0; j < reader.size(); j++) {
+      const SeqView &sequence = reader[j];
+      auto all_sequence_ids = ExtractNCBISequenceIDs(sequence.header,
+                                                     sequence.header_len);
       taxid_t taxid = 0;
       for (auto &seqid : all_sequence_ids) {
         if (ID_to_taxon_map.count(seqid) == 0 ||
@@ -426,18 +433,18 @@ void BuildBlockedTable(const Taxonomy &taxonomy,
       }
       if (! taxid)
         continue;
-      const string &seq = sequence->seq;
+      size_t len = sequence.seq_len;
       // Consecutive subblocks overlap by k - 1 characters, so every k-mer
       // lies wholly inside at least one of them.
-      for (size_t i = 0; i < seq.size(); i += opts.subblock_size) {
-        size_t finish = std::min(seq.size(), i + opts.subblock_size + opts.k - 1);
-        Item item = { &seq, taxid, i, finish };
+      for (size_t i = 0; i < len; i += opts.subblock_size) {
+        size_t finish = std::min(len, i + opts.subblock_size + opts.k - 1);
+        Item item = { sequence.seq, len, taxid, i, finish };
         items.push_back(item);
-        if (finish == seq.size())
+        if (finish == len)
           break;
       }
       processed_seq_ct++;
-      processed_ch_ct += seq.size();
+      processed_ch_ct += len;
     }
     #pragma omp parallel num_threads(threads)
     {
@@ -447,7 +454,7 @@ void BuildBlockedTable(const Taxonomy &taxonomy,
       #pragma omp for schedule(dynamic, 64)
       for (size_t n = 0; n < items.size(); n++) {
         const Item &it = items[n];
-        scanner.LoadSequence(*it.seq, it.start, it.finish);
+        scanner.LoadSequence(it.seq, it.len, it.start, it.finish);
         uint64_t *minimizer_ptr;
         uint64_t last = UINT64_MAX;
         while ((minimizer_ptr = scanner.NextMinimizer())) {
@@ -469,6 +476,10 @@ void BuildBlockedTable(const Taxonomy &taxonomy,
                 << processed_ch_ct << " bp)...";
     }
   }
+  if (! cursor.error.empty())
+    errx(EX_IOERR, "%s (standard input)", cursor.error.c_str());
+  if (! reader.fault().empty())
+    warnx("%s", reader.fault().c_str());
   if (isatty(fileno(stderr)))
     std::cerr << "\r";
   std::cerr << "Completed processing of " << processed_seq_ct << " sequences, "
