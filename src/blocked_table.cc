@@ -42,6 +42,12 @@ void Geometry::init(uint64_t pext_mask, int partition_bits, uint64_t buckets,
     fm_sf.init(sf);
 }
 
+bool Geometry::exact() const {
+  uint64_t range = (uint64_t) ((((unsigned __int128) 1 << q) + nb - 1) / nb);
+  int r_exact = range <= 1 ? 1 : 64 - __builtin_clzll(range - 1);
+  return r >= r_exact;
+}
+
 }  // namespace blocked
 
 // Lookup code specialized on the slot width W, so the slot offsets, the slot
@@ -320,6 +326,38 @@ void BlockedTable::GetBatch(const hkey_t *keys, hvalue_t *out, size_t n) const {
   if (code_taxa_)
     for (size_t i = 0; i < n; i++)
       out[i] = code_taxa_[out[i]];
+}
+
+void BlockedTable::ForEachKey(const std::function<void(uint64_t, hvalue_t)> &f) const {
+  const blocked::Geometry &G = geo_;
+  if (! G.exact())
+    errx(EX_DATAERR, "keys cannot be read back from a fingerprint table "
+         "(r = %d)", G.r);
+  auto taxon = [&](uint64_t code) -> hvalue_t {
+    return code_taxa_ ? code_taxa_[code] : (hvalue_t) code;
+  };
+  for (uint64_t part = 0; part < G.K; part++) {
+    for (uint64_t b = 0; b < G.nb; b++) {
+      const uint8_t *bp = buckets_ + ((part * G.nb + b) << 6);
+      uint64_t h0;
+      memcpy(&h0, bp, 8);
+      unsigned natives = h0 & 127, total = (h0 >> 7) & 127;
+      for (unsigned i = 0; i < total; i++) {
+        int off = G.H + i * G.w;
+        int byte = std::min(off >> 3, 56);
+        uint64_t s;
+        memcpy(&s, bp + byte, 8);
+        s >>= off - byte * 8;
+        uint64_t rem = s & G.rmask, code = (s >> G.r) & G.vmask;
+        uint64_t home = i < natives ? b : G.guest_home(b, rem);
+        f(G.unhash(G.unlocate(part, home, rem)), taxon(code));
+      }
+    }
+    for (uint64_t i = stash_offsets_[part]; i < stash_offsets_[part + 1]; i++) {
+      uint64_t home = stash_keys_[i] >> G.r, rem = stash_keys_[i] & G.rmask;
+      f(G.unhash(G.unlocate(part, home, rem)), taxon(stash_vals_[i]));
+    }
+  }
 }
 
 // ------------------------------------------------------------------ builder
