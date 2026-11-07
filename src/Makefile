@@ -12,7 +12,7 @@ CFLAGS = -Wall -std=c99 -O2 -g
 
 .PHONY: all clean install
 
-PROGS = estimate_capacity build_db classify bracken_distrib dump_table lookup_accession_numbers k2mask blast_to_fasta merge libtax.so
+PROGS = estimate_capacity build_db classify bracken_distrib dump_table k2surgery lookup_accession_numbers k2mask blast_to_fasta merge libtax.so
 
 all: $(PROGS)
 
@@ -62,6 +62,11 @@ bracken_distrib: bracken_distrib.o blocked_table.o mmap_file.o compact_hash.o fa
 
 estimate_capacity: estimate_capacity.o fast_reader.o bgzf_index.o mmscanner.o omp_hack.o utilities.o
 	$(CXX) $(CXXFLAGS) -o $@ estimate_capacity.o fast_reader.o bgzf_index.o mmscanner.o omp_hack.o utilities.o $(LDFLAGS) $(KRAKEN2_INFLATE_LIB)
+
+k2surgery.o: k2surgery.cc blocked_table.h taxonomy.h kv_store.h kraken2_headers.h
+
+k2surgery: k2surgery.o blocked_table.o mmap_file.o compact_hash.o taxonomy.o omp_hack.o utilities.o
+	$(CXX) $(CXXFLAGS) -o $@ k2surgery.o blocked_table.o mmap_file.o compact_hash.o taxonomy.o omp_hack.o utilities.o $(LDFLAGS)
 
 dump_table: dump_table.o mmap_file.o compact_hash.o omp_hack.o taxonomy.o reports.o hyperloglogplus.o
 	$(CXX) $(CXXFLAGS) -o $@ dump_table.o mmap_file.o compact_hash.o omp_hack.o taxonomy.o reports.o hyperloglogplus.o $(LDFLAGS)

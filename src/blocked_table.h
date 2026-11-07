@@ -70,6 +70,7 @@
 #include "kraken2_headers.h"
 #include "taxonomy.h"
 
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -182,6 +183,14 @@ struct Pext {
       x |= ((m >> src[i]) & mask[i]) << dst[i];
     return x;
   }
+  // Inverse of the above (a bit deposit): x's low width bits go back to the
+  // mask's positions.
+  inline uint64_t deposit(uint64_t x) const {
+    uint64_t m = 0;
+    for (int i = 0; i < nruns; i++)
+      m |= ((x >> dst[i]) & mask[i]) << src[i];
+    return m;
+  }
 };
 
 // Bijection on B bits: xorshifts and odd multiplies mod 2^B.
@@ -193,6 +202,30 @@ struct Mix {
     x ^= x >> (B / 2 - 1); x = (x * 0xff51afd7ed558ccdULL) & M;
     x ^= x >> (B / 2 + 1); x = (x * 0xc4ceb9fe1a85ec53ULL) & M;
     x ^= x >> (B / 2);
+    return x;
+  }
+  // x with y = x ^ (x >> s) undone, on B bits.
+  inline uint64_t unshift(uint64_t y, int s) const {
+    uint64_t x = y;
+    for (int done = s; done < B; done += s)
+      x = y ^ (x >> s);
+    return x;
+  }
+  // Inverse of an odd number mod 2^64 by Newton's iteration; its low B bits
+  // are the inverse mod 2^B.
+  static uint64_t odd_inverse(uint64_t a) {
+    uint64_t x = a;
+    for (int i = 0; i < 5; i++)
+      x *= 2 - a * x;
+    return x;
+  }
+  inline uint64_t inverse(uint64_t x) const {
+    x &= M;
+    x = unshift(x, B / 2);
+    x = (x * odd_inverse(0xc4ceb9fe1a85ec53ULL)) & M;
+    x = unshift(x, B / 2 + 1);
+    x = (x * odd_inverse(0xff51afd7ed558ccdULL)) & M;
+    x = unshift(x, B / 2 - 1);
     return x;
   }
 };
@@ -223,6 +256,21 @@ struct Geometry {
     uint64_t a = home + 1 + fm_alt.mod(murmur(rem ^ ALT_SALT));
     return a >= nb ? a - nb : a;
   }
+  // Inverses for reading keys back out of an exact table.  unlocate gives
+  // the hash whose (part, home, rem) these are; that is unique only when r
+  // is at least the exact width.  guest_home is the home of a key with this
+  // rem stored in bucket a as a guest.  unhash gives the minimizer.
+  inline uint64_t unlocate(uint64_t part, uint64_t home, uint64_t rem) const {
+    uint64_t lo = (uint64_t) ((((unsigned __int128) home << q) + nb - 1) / nb);
+    return (part << q) | (lo + rem);
+  }
+  inline uint64_t guest_home(uint64_t a, uint64_t rem) const {
+    uint64_t back = 1 + fm_alt.mod(murmur(rem ^ ALT_SALT));
+    return a >= back ? a - back : a + nb - back;
+  }
+  inline uint64_t unhash(uint64_t h) const { return pext.deposit(mix.inverse(h)); }
+  // Whether r keeps every key in a bucket's range distinct.
+  bool exact() const;
   inline unsigned spill_bit(uint64_t rem) const {
     return sf == 1 ? 0 : (unsigned) fm_sf.mod(murmur(rem ^ SPILL_SALT));
   }
@@ -242,6 +290,12 @@ class BlockedTable : public KeyValueStore {
   hvalue_t GetByHash(uint64_t h) const;
 
   const BlockedTableHeader &header() const { return header_; }
+
+  // Calls f(minimizer, taxon) for every stored key: the slots of each
+  // bucket in table order, then the partition's stash.  taxon is the
+  // internal taxon ID.  Needs an exact table, since a fingerprint keeps too
+  // few bits of the key to recover it.
+  void ForEachKey(const std::function<void(uint64_t, hvalue_t)> &f) const;
   const blocked::Geometry &geometry() const { return geo_; }
 
   private:
