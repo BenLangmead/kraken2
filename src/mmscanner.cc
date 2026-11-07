@@ -22,8 +22,8 @@ MinimizerScanner::MinimizerScanner(ssize_t k, ssize_t l,
     int revcom_version)
     : str_(nullptr), str_len_(0), k_(k), l_(l), str_pos_(0), start_(0), finish_(0),
       spaced_seed_mask_(spaced_seed_mask), dna_(dna_sequence),
-      toggle_mask_(toggle_mask), loaded_ch_(0),
-      last_ambig_(0), revcom_version_(revcom_version)
+      toggle_mask_(toggle_mask), run_(0), window_(k - l + 1, ~(uint64_t) 0),
+      window_pos_(0), ambig_(false), revcom_version_(revcom_version)
 {
   if (l_ > (ssize_t) ((sizeof(uint64_t) * 8 - 1) / (dna_ ? BITS_PER_CHAR_DNA : BITS_PER_CHAR_PRO)))
     errx(EX_SOFTWARE, "l exceeds size limits for minimizer %s scanner",
@@ -107,89 +107,13 @@ void MinimizerScanner::LoadSequence(const char *seq, size_t len, size_t start,
     finish_ = str_len_;
   if ((ssize_t) (finish_ - start_) + 1 < l_)  // Invalidate scanner if interval < 1 l-mer
     str_pos_ = finish_;
-  queue_.clear();
-  queue_pos_ = 0;
-  loaded_ch_ = 0;
   last_minimizer_ = ~0;
-  last_ambig_ = 0;
   lmer_ = 0;
-}
-
-uint64_t *MinimizerScanner::NextMinimizer() {
-  if (str_pos_ >= finish_)  // Abort if we've exhausted string interval
-    return nullptr;
-  bool changed_minimizer = false;
-  auto bits_per_char = dna_ ? BITS_PER_CHAR_DNA : BITS_PER_CHAR_PRO;
-  auto ambig_code = (1u << bits_per_char) - 1;
-  while (! changed_minimizer) {
-    // Incorporate next character (and more if needed to fill l-mer)
-    if (loaded_ch_ == l_)
-      loaded_ch_--;
-    while (loaded_ch_ < l_ && str_pos_ < finish_) {  // char loading loop
-      loaded_ch_++;
-      lmer_ <<= bits_per_char;
-      last_ambig_ <<= bits_per_char;
-      auto lookup_code = lookup_table_[ (uint8_t) str_[str_pos_++] ];
-      if (lookup_code == UINT8_MAX) {
-        queue_.clear();
-        queue_pos_ = 0;
-        lmer_ = 0;
-        loaded_ch_ = 0;
-        last_ambig_ |= ambig_code;
-      }
-      else
-        lmer_ |= lookup_code;
-      lmer_ &= lmer_mask_;
-      last_ambig_ &= lmer_mask_;
-      // If we haven't filled up first k-mer, don't return
-      // Otherwise, if l-mer is incomplete, still return
-      // If l-mer is complete, go through queue management
-      // If we don't have a full l-mer, there's no point in
-      // queue management for minimizer calculation
-      if ((str_pos_ - start_) >= (size_t) k_ && loaded_ch_ < l_)
-        return &last_minimizer_;
-    }  // end character loading loop
-    if (loaded_ch_ < l_)  // Abort if we've exhausted string interval w/o
-      return nullptr;     //   filling the l-mer
-    uint64_t canonical_lmer = dna_ ? canonical_representation(lmer_, l_) : lmer_;
-    if (spaced_seed_mask_)
-      canonical_lmer &= spaced_seed_mask_;
-    uint64_t candidate_lmer = canonical_lmer ^ toggle_mask_;
-    if (k_ == l_) {  // Short-circuit queue work
-      last_minimizer_ = candidate_lmer ^ toggle_mask_;
-      return &last_minimizer_;
-    }
-    // Sliding window minimum calculation
-    while (! queue_.empty() && queue_.back().candidate > candidate_lmer)
-      queue_.pop_back();
-    MinimizerData data = { candidate_lmer, queue_pos_ };
-    if (queue_.empty() && queue_pos_ >= k_ - l_) {
-      // Empty queue means front will change
-      // Minimizer will change iff we've processed enough l-mers
-      changed_minimizer = true;
-    }
-    queue_.push_back(data);
-    // expire an l-mer not in the current window
-    if (queue_.front().pos < queue_pos_ - k_ + l_) {
-      // queue_.erase(queue_.begin());
-      queue_.erase(queue_.begin());
-      // Change in front means minimizer changed
-      changed_minimizer = true;
-    }
-
-    // Change from no minimizer (beginning of sequence/near ambig. char)
-    if (queue_pos_ == k_ - l_)
-      changed_minimizer = true;
-    queue_pos_++;
-
-    // Return only if we've read in at least one k-mer's worth of chars
-    if (str_pos_ >= (size_t) k_) {
-      break;
-    }
-  }  // end while ! changed_minimizer
-  assert(! queue_.empty());
-  last_minimizer_ = queue_.front().candidate ^ toggle_mask_;
-  return &last_minimizer_;
+  rc_lmer_ = 0;
+  run_ = 0;
+  std::fill(window_.begin(), window_.end(), ~(uint64_t) 0);
+  window_pos_ = 0;
+  ambig_ = false;
 }
 
 // Adapted for 64-bit DNA use from public domain code at:
