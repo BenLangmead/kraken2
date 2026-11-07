@@ -12,7 +12,7 @@ CFLAGS = -Wall -std=c99 -O2 -g
 
 .PHONY: all clean install
 
-PROGS = estimate_capacity build_db classify dump_table lookup_accession_numbers k2mask blast_to_fasta merge libtax.so
+PROGS = estimate_capacity build_db classify bracken_distrib dump_table lookup_accession_numbers k2mask blast_to_fasta merge libtax.so
 
 all: $(PROGS)
 
@@ -37,6 +37,7 @@ aa_translate.o: aa_translate.cc aa_translate.h
 utilities.o: utilities.cc utilities.h
 
 classify.o: classify.cc blocked_table.h fast_reader.h bgzf_index.h k2_profile.h kraken2_data.h kv_store.h taxonomy.h mmscanner.h compact_hash.h aa_translate.h reports.h utilities.h readcounts.h
+bracken_distrib.o: bracken_distrib.cc blocked_table.h fast_reader.h bgzf_index.h kraken2_data.h kv_store.h taxonomy.h mmscanner.h compact_hash.h utilities.h
 dump_table.o: dump_table.cc compact_hash.h taxonomy.h mmscanner.h kraken2_data.h reports.h
 estimate_capacity.o: estimate_capacity.cc kv_store.h mmscanner.h fast_reader.h utilities.h
 build_db.o: build_db.cc blocked_table.h build_db.h fast_reader.h taxonomy.h mmscanner.h compact_hash.h kv_store.h kraken2_data.h utilities.h
@@ -55,6 +56,9 @@ build_db: build_db.o blocked_table.o mmap_file.o compact_hash.o fast_reader.o bg
 
 classify: classify.o blocked_table.o reports.o hyperloglogplus.o mmap_file.o compact_hash.o taxonomy.o mmscanner.o omp_hack.o aa_translate.o utilities.o fast_reader.o bgzf_index.o k2_profile.o
 	$(CXX) $(CXXFLAGS) -o $@ classify.o blocked_table.o fast_reader.o bgzf_index.o k2_profile.o reports.o hyperloglogplus.o mmap_file.o compact_hash.o taxonomy.o mmscanner.o omp_hack.o aa_translate.o utilities.o $(LDFLAGS) $(KRAKEN2_INFLATE_LIB)
+
+bracken_distrib: bracken_distrib.o blocked_table.o mmap_file.o compact_hash.o fast_reader.o bgzf_index.o taxonomy.o mmscanner.o omp_hack.o utilities.o
+	$(CXX) $(CXXFLAGS) -o $@ bracken_distrib.o blocked_table.o mmap_file.o compact_hash.o fast_reader.o bgzf_index.o taxonomy.o mmscanner.o omp_hack.o utilities.o $(LDFLAGS) $(KRAKEN2_INFLATE_LIB)
 
 estimate_capacity: estimate_capacity.o fast_reader.o bgzf_index.o mmscanner.o omp_hack.o utilities.o
 	$(CXX) $(CXXFLAGS) -o $@ estimate_capacity.o fast_reader.o bgzf_index.o mmscanner.o omp_hack.o utilities.o $(LDFLAGS) $(KRAKEN2_INFLATE_LIB)
